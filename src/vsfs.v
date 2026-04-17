@@ -1,0 +1,3156 @@
+
+/* Matt pongsagon
+
+  - addr Flash and RAM front start at 0
+  - addr RAM back start at 38400 (320x240=76800/2, 2pixel:1byte)
+  - addr RAM z start at 76800 (1pixel:1byte)
+  	- front 4bit, back 4bit, z 8bit
+		- cal z in Q2.20 save in Q0.8 [0,1]
+  - addr Tri
+      // has tex
+      - start 153600: 	32768 byte: 256x256 tex
+      - start 186368: 	each tri: 28 byte
+      // no tex
+      - start 153600: 	each tri: 22 byte
+
+	gamepad_input 8 bit
+		0,1: +-rotX
+		2,3: +-rotY
+		4,5: +-Tz
+		6,7: +-rotY light
+
+  color mode 1 tex
+  	0: black
+  	1: blue
+  	2: dark green
+		15:
+
+	color mode 2 flat shade, each with 3 level + black
+		0: white
+		1: cyan
+		2: magenta
+		3: yellow
+ 
+  VSFS
+  	// free state [22-30, 64-73,130-139, 179-189, 224-229,233-239,243-249]
+  		4.5: use state 2-21 for uv*bar
+  		tex: use state 211-223
+		0. perframe, state [140-250], quota 800x430 = 340,000 clk
+			- Tz, rotx2 -> [M] ([Tz*Rx*Ry]) // cos table, set premul mat manually 
+			- dir light rot 1axis -> update formula
+			- [M]*[VP] 			// no cam fix [VP]
+			- [M]-1 ([Ryt*Rxt*Tz-1]) // override [M], for light-world, campos-world -> model 
+			- [M-1]*campos 
+			- [M-1]*lightdir
+
+    1. for each tri, state [31-129, 254,255]
+    	- READ tri (pos.xyz x3 Q8.8, face normal Q2.8 x3, color 2bit)
+
+    2. VS
+			- x1: backface culling (view-model dot faceNormal-model)
+			- x3: [MVP]*v, clip->NDC (div), NDC->screen
+			- x1: light-model dot faceNormal-model
+
+    3. bbox
+      - bbox (mul of 4, not chk outofrange, 3clk)   
+    4. e0, bar, zbar
+      4.1 x3: e_init
+      4.2 denom
+      4.3 x3: bar_init, bar_dx, bar_dy
+      4.4 x3: z_bar, z_bar_dx, z_bar_dy
+      4.5 x2: uv*bar
+    5. for pixel y in bbox (y < bboxMax_Y)
+      - e0 = e0_init, z = z_bar / e0_init += dy, z_bar += z_bar_dy
+      - for x in bbox (x < bboxMax_X)
+        - READ x4 Z+B (42 clk)
+        - READ x4 texel (35 clk x2)
+        // x4 pixel
+        - if ((e0 < 0) && (e1 < 0) && (e2 < 0)) / e0 += dx, z += z_bar_dx
+          - pixel[0-4].cz = (Z < Zbuffer)? cz: pixel[0-4].cz
+        //
+        - WRITE x4 Z+B (28 clk) 
+ 
+	Data type in pipeline
+
+
+		
+*/
+
+`timescale 1ns / 1ps
+
+
+module vsfs (
+    input  	wire       	clk,     
+    input  	wire       	reset,   
+    output  reg [23:0] 	vsfs_addr,
+  	output  reg [3:0] 	vsfs_data_in,
+  	output  reg 				vsfs_start_read,
+  	output  reg					vsfs_start_write,
+  	output  reg 				vsfs_stop_txn,
+  	input 	wire [3:0]	spi_data,
+  	input   wire 				spi_data_req,
+  	input		wire 				start_vsfs,
+  	output  reg 				do_swap,
+  	output  reg 				vsfs_running,
+  	input 	wire [9:0]  x,
+  	input 	wire [9:0]  y,
+  	input		wire [9:0]	numtri,
+  	input   wire 				evenframe,
+
+  	// gamepad input
+  	input 	wire [7:0]  gamepad_input,
+  	input   wire 				has_tex,
+  	
+
+    // things to watch
+    // output  wire [15:0] debug_x_model_v0,
+    // output  wire [15:0] debug_x_model_v1,
+    // output  wire [15:0] debug_x_model_v2,
+    // output  wire [15:0] debug_y_model_v0,
+    // output  wire [15:0] debug_y_model_v1,
+    // output  wire [15:0] debug_y_model_v2,
+    // output  wire [15:0] debug_z_model_v0,
+    // output  wire [15:0] debug_z_model_v1,
+    // output  wire [15:0] debug_z_model_v2,
+    // output  wire [15:0] debug_nx,
+    // output  wire [15:0] debug_ny,
+    // output  wire [15:0] debug_nz,
+    // output  wire [1:0] debug_tri_color,
+    // output  wire [7:0]  debug_vsfs_fsm_state,
+
+    input		wire 				ram_notbusy
+
+  );
+
+
+  // used by div w
+	reg signed [31:0] div_a;  
+	reg signed [31:0] div_b;  
+	wire signed [31:0] div_result;
+  reg div_start;
+	wire div_done;
+	wire div_busy;
+	wire div_valid;
+	wire div_dbz;
+	wire div_ovf;
+	// Q16.16
+  div div1 (.clk (clk), .rst(reset),.start(div_start),.done(div_done)
+  		  ,.a(div_a),.b(div_b),.val(div_result)
+  		  ,.busy(div_busy),.valid(div_valid),.dbz(div_dbz),.ovf(div_ovf));
+
+  // used by denom, (div w and denom can be computed at the same time)
+  // Q20.20
+  reg signed [39:0] div2_a;  
+	reg signed [39:0] div2_b;  
+	wire signed [39:0] div2_result;
+  reg div2_start;
+	wire div2_done;
+	wire div2_busy;
+	wire div2_valid;
+	wire div2_dbz;
+	wire div2_ovf;
+  div #(.WIDTH(40),.FBITS(20)) div2 
+    		  (.clk (clk), .rst(reset),.start(div2_start),.done(div2_done)
+    		  ,.a(div2_a),.b(div2_b),.val(div2_result)
+    		  ,.busy(div2_busy),.valid(div2_valid),.dbz(div2_dbz),.ovf(div2_ovf));
+
+	// mul 22-bit used to compute ei_init, bar
+	reg signed [21:0] mul_a;  
+	reg signed [21:0] mul_b;  
+  wire signed [43:0] mul_result;  
+  reg mul_start;
+  wire mul_done;
+  wire mul_busy;
+  wire mul_aux;
+  slowmpy #(.LGNA(5),.NA(22)) mul 
+  			(.i_clk (clk), .i_reset(reset), .i_stb(mul_start),.i_a(mul_a)
+  			,.i_b(mul_b),.i_aux(1'b0),.o_done(mul_done),.o_p(mul_result)
+  			,.o_busy(mul_busy),.o_aux(mul_aux));
+
+  reg dot_start;
+  wire dot_done;
+  // use in always @(*), not infer registers (that's not what declare the signal of reg type means), 
+  // it infers a multiplexer with constant assignment 
+  reg signed [15:0] v1_x;			
+	reg signed [15:0] v1_y;
+	reg signed [15:0] v1_z;
+	reg signed [15:0] v1_w;
+	reg signed [15:0] v2_x;
+	reg signed [15:0] v2_y;
+	reg signed [15:0] v2_z;
+	reg signed [15:0] v2_w;
+  wire signed [17:0] dot_result;
+  dot4 dot (.clk (clk), .reset(reset),.start(dot_start)
+  			,.v1_x(v1_x),.v1_y(v1_y),.v1_z(v1_z),.v1_w(v1_w)
+  			,.v2_x(v2_x),.v2_y(v2_y),.v2_z(v2_z),.v2_w(v2_w)
+  			,.done(dot_done),.result(dot_result));
+
+ 
+ 	// main FSM
+	reg [7:0] fsm_state; 
+	// [M]/[M-1] (use the same reg), [MVP] (row major)
+	reg signed [15:0] M_00;					// Q8.8
+	reg signed [15:0] M_01;
+	reg signed [15:0] M_02;
+	reg signed [15:0] M_03;
+	reg signed [15:0] M_10;					
+	reg signed [15:0] M_11;
+	reg signed [15:0] M_12;
+	reg signed [15:0] M_13;
+	reg signed [15:0] M_20;					
+	reg signed [15:0] M_21;
+	reg signed [15:0] M_22;
+	reg signed [15:0] M_23;
+	reg signed [15:0] M_30;					
+	reg signed [15:0] M_31;
+	reg signed [15:0] M_32;
+	reg signed [15:0] M_33;
+	reg signed [15:0] MVP_00;					// Q8.8
+	reg signed [15:0] MVP_01;
+	reg signed [15:0] MVP_02;
+	reg signed [15:0] MVP_03;
+	reg signed [15:0] MVP_10;					
+	reg signed [15:0] MVP_11;
+	reg signed [15:0] MVP_12;
+	reg signed [15:0] MVP_13;
+	reg signed [15:0] MVP_20;					
+	reg signed [15:0] MVP_21;
+	reg signed [15:0] MVP_22;
+	reg signed [15:0] MVP_23;
+	reg signed [15:0] MVP_30;					
+	reg signed [15:0] MVP_31;
+	reg signed [15:0] MVP_32;
+	reg signed [15:0] MVP_33;
+	
+	// read tri from RAM
+	reg [4:0] read_delay;
+	reg [17:0] numread;  
+	reg [9:0] tri_idx;									// max 1024 tri
+	wire [15:0] tri_idx_addr;     			// in byte: numtri * 22 (2 x 3xyz x 3vert + 4 (normal/color));
+  wire [15:0] tri_idx_addr_tex;
+  assign tri_idx_addr = {2'b0,tri_idx,4'b0} + {4'b0,tri_idx,2'b0} + {5'b0,tri_idx,1'b0};
+	assign tri_idx_addr_tex = {2'b0,tri_idx,4'b0} + {3'b0,tri_idx,3'b0} + {4'b0,tri_idx,2'b0} + {16'h8000};
+	
+	reg signed [15:0] tri_xyz [13:0];		
+	
+	// model space/NDC (use the same reg)
+	reg signed [15:0] x_model_v0;				// Q8.8 from file
+	reg signed [15:0] x_model_v1;
+	reg signed [15:0] x_model_v2;
+	reg signed [15:0] y_model_v0;				
+	reg signed [15:0] y_model_v1;
+	reg signed [15:0] y_model_v2;
+	reg signed [15:0] z_model_v0;				
+	reg signed [15:0] z_model_v1;
+	reg signed [15:0] z_model_v2;
+	reg [7:0] 				v0_u;							// Q8.0
+	reg [7:0] 				v0_v;
+	reg [7:0] 				v1_u;							
+	reg [7:0] 				v1_v;
+	reg [7:0] 				v2_u;							
+	reg [7:0] 				v2_v;
+	reg signed [17:0] x_clip_v0;				// Q10.8
+	reg signed [17:0] x_clip_v1;
+	reg signed [17:0] x_clip_v2;
+	reg signed [17:0] y_clip_v0;
+	reg signed [17:0] y_clip_v1;
+	reg signed [17:0] y_clip_v2;
+	reg signed [17:0] z_clip_v0;
+	reg signed [17:0] z_clip_v1;
+	reg signed [17:0] z_clip_v2;
+	reg signed [17:0] w_clip_v0;
+	reg signed [17:0] w_clip_v1;
+	reg signed [17:0] w_clip_v2;
+	reg signed [15:0] campos_x;					// Q8.8, model space, world space(fix)
+	reg signed [15:0] campos_y;
+	reg signed [15:0] campos_z;
+	reg signed [15:0] nx;								// Q8.8 <- Q2.8 from file
+	reg signed [15:0] ny;
+	reg signed [15:0] nz;	
+	reg signed [15:0] light_x;					// Q8.8, init light
+	reg signed [15:0] light_y;
+	reg signed [15:0] light_z;	
+	reg signed [15:0] lightW_x;					// Q8.8, world space
+	reg signed [15:0] lightW_y;
+	reg signed [15:0] lightW_z;	
+	reg signed [15:0] lightM_x;					// Q8.8, model space
+	reg signed [15:0] lightM_y;
+	reg signed [15:0] lightM_z;	
+	reg signed [15:0] viewdir_x;				// Q8.8, model space
+	reg signed [15:0] viewdir_y;
+	reg signed [15:0] viewdir_z;	
+	reg [1:0] tri_color;
+	reg [3:0] shade_color;
+	// screenspace
+	reg signed [19:0] x_screen_v0;			// Q20.0
+	reg signed [19:0] x_screen_v1;
+	reg signed [19:0] x_screen_v2;
+	reg signed [19:0] y_screen_v0;
+	reg signed [19:0] y_screen_v1;
+	reg signed [19:0] y_screen_v2;
+	reg signed [21:0] z_screen_v0;			// Q2.20, to match with bar
+	reg signed [21:0] z_screen_v1;
+	reg signed [21:0] z_screen_v2;
+	reg signed [19:0] bboxMin_X;				// Q20.0 for screenspace
+	reg signed [19:0] bboxMin_Y;				// Q3.17 for NDC
+	reg signed [19:0] bboxMax_X;
+	reg signed [19:0] bboxMax_Y;
+	//
+	reg signed [19:0] e0_init;					// Q20.0
+	reg signed [19:0] e1_init;
+	reg signed [19:0] e2_init;
+	// for compute ei_int,
+  reg signed [19:0] tmp_ei_mul1;
+  reg signed [19:0] tmp_ei_mul2;
+  // bar_iy, bar_iz, denom
+  reg signed [21:0] denom;						// Q2.20  [-1,0.999]
+  reg signed [21:0] bar_ix;						// Q6.16, not using Q2.20 cause data overflow [-1,0.999]
+  reg signed [21:0] bar_ix_dx;
+  reg signed [21:0] bar_ix_dy;
+  reg signed [21:0] bar_iy;						// Q6.16
+  reg signed [21:0] bar_iy_dx;
+  reg signed [21:0] bar_iy_dy;				
+  reg signed [21:0] bar_iz;
+  reg signed [21:0] bar_iz_dx;
+  reg signed [21:0] bar_iz_dy;
+  // bar interpolate z
+  reg signed [21:0] z_bar;						// Q6.16
+  reg signed [21:0] z_bar_dx;
+  reg signed [21:0] z_bar_dy;
+  // bar uv
+  reg signed [21:0] u_bar;						// Q14.8 (for neg/>1 out of tri bar) 
+  reg signed [21:0] u_bar_dx;
+  reg signed [21:0] u_bar_dy;
+  reg signed [21:0] v_bar;						
+  reg signed [21:0] v_bar_dx;
+  reg signed [21:0] v_bar_dy;
+  // in for loop
+  reg [9:0] pixel_y;									// Q10.0
+  reg [9:0] pixel_x;
+  reg signed [21:0] pixel_z;					// Q6.16
+  reg signed [21:0] pixel_u;					// Q10.12 -> Q8.0 when sampling tex
+  reg signed [21:0] pixel_v;
+  reg pixel_u8;	
+  reg signed [19:0] e0;
+  reg signed [19:0] e1;
+  reg signed [19:0] e2;
+  // 4-pixel Z, Color buffer
+  reg [7:0] db_texel;									// use for reading from RAM
+  reg [3:0] texel [3:0];							// Q4.0
+  reg [7:0] Z_buffer [3:0];						// Q0.8
+  reg [3:0] C_buffer [3:0];						// Q4.0
+
+  // from gamepad
+  reg manualRot;										// 0: do autoRot, 1: manual
+	reg [8:0] rotY_angle;							// 0-359 
+  reg [8:0] rotY_angle_90;					// for fixCos(i) = fixSin(i + 90)
+  reg [8:0] rotX_angle;							
+  reg [8:0] rotX_angle_90;
+  reg signed [7:0] translate_z;			// [-127,127]
+  reg [8:0] rotY_light;							
+  reg [8:0] rotY_light_90;
+
+  // to compute [M],[M-1]
+  wire [7:0] sine_value;
+  reg [8:0] sine_angle;
+	reg signed [15:0] cosTheta;						// Q8.8, [M] use Q8.8, may reduce to Q2.8 to save space
+	reg signed [15:0] sinTheta;
+	reg signed [15:0] cosPhi;							
+	reg signed [15:0] sinPhi;
+	reg signed [15:0] cosLight;							
+	reg signed [15:0] sinLight;
+	reg signed [15:0] cosTheta_sinPhi;		// Q8.8
+	reg signed [15:0] sinTheta_cosPhi;
+	reg signed [15:0] cosTheta_cosPhi;		
+	reg signed [15:0] sinTheta_sinPhi;
+	reg signed [15:0] sinTheta_Tz;				
+	reg signed [15:0] cosTheta_sinPhi_Tz;
+	reg signed [15:0] cosTheta_cosPhi_Tz;
+  sine_rom sine_rom1(.angle(sine_angle[6:0]),.value(sine_value));
+
+
+  // for setting wire input to dot4 module
+  always @(*)begin
+  	case (fsm_state)
+  		// [M-1]*campos
+  		230: begin
+  			v1_x = 0;
+				v1_y = 0;
+				v1_z = 16'sb0010_1000_0000_0000;			// campos in world, fix
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = M_00;
+				v2_y = M_01;
+				v2_z = M_02;
+				v2_w = M_03;
+  		end
+  		231: begin
+  			v1_x = 0;
+				v1_y = 0;
+				v1_z = 16'sb0010_1000_0000_0000;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = M_10;
+				v2_y = M_11;
+				v2_z = M_12;
+				v2_w = M_13;
+  		end
+  		232: begin
+  			v1_x = 0;
+				v1_y = 0;
+				v1_z = 16'sb0010_1000_0000_0000;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = M_20;
+				v2_y = M_21;
+				v2_z = M_22;
+				v2_w = M_23;
+  		end
+  		// [M-1]*light
+  		240: begin
+  			v1_x = lightW_x;
+				v1_y = lightW_y;
+				v1_z = lightW_z;
+				v1_w = 16'sb0000_0000_0000_0000;
+				v2_x = M_00;
+				v2_y = M_01;
+				v2_z = M_02;
+				v2_w = M_03;
+  		end
+  		241: begin
+  			v1_x = lightW_x;
+				v1_y = lightW_y;
+				v1_z = lightW_z;
+				v1_w = 16'sb0000_0000_0000_0000;
+				v2_x = M_10;
+				v2_y = M_11;
+				v2_z = M_12;
+				v2_w = M_13;
+  		end
+  		242: begin
+  			v1_x = lightW_x;
+				v1_y = lightW_y;
+				v1_z = lightW_z;
+				v1_w = 16'sb0000_0000_0000_0000;
+				v2_x = M_20;
+				v2_y = M_21;
+				v2_z = M_22;
+				v2_w = M_23;
+  		end
+
+  		// backface culling
+  		36: begin
+  			v1_x = nx;
+				v1_y = ny;
+				v1_z = nz;
+				v1_w = 16'sb0000_0000_0000_0000;
+				v2_x = viewdir_x;
+				v2_y = viewdir_y;
+				v2_z = viewdir_z;
+				v2_w = 16'sb0000_0000_0000_0000;
+  		end
+  		// for dot(light,n)
+			63: begin
+				v1_x = nx;
+				v1_y = ny;
+				v1_z = nz;
+				v1_w = 16'sb0000_0000_0000_0000;
+				v2_x = lightM_x;
+				v2_y = lightM_y;
+				v2_z = lightM_z;
+				v2_w = 16'sb0000_0000_0000_0000;
+			end
+  		// [MVP]*v, state 38-49
+  		38: begin
+  			v1_x = x_model_v0;
+				v1_y = y_model_v0;
+				v1_z = z_model_v0;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_00;
+				v2_y = MVP_01;
+				v2_z = MVP_02;
+				v2_w = MVP_03;
+  		end
+  		39: begin
+  			v1_x = x_model_v0;
+				v1_y = y_model_v0;
+				v1_z = z_model_v0;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_10;
+				v2_y = MVP_11;
+				v2_z = MVP_12;
+				v2_w = MVP_13;
+  		end
+  		40: begin
+  			v1_x = x_model_v0;
+				v1_y = y_model_v0;
+				v1_z = z_model_v0;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_20;
+				v2_y = MVP_21;
+				v2_z = MVP_22;
+				v2_w = MVP_23;
+  		end
+  		41: begin
+  			v1_x = x_model_v0;
+				v1_y = y_model_v0;
+				v1_z = z_model_v0;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_30;
+				v2_y = MVP_31;
+				v2_z = MVP_32;
+				v2_w = MVP_33;
+  		end
+  		42: begin
+  			v1_x = x_model_v1;
+				v1_y = y_model_v1;
+				v1_z = z_model_v1;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_00;
+				v2_y = MVP_01;
+				v2_z = MVP_02;
+				v2_w = MVP_03;
+  		end
+  		43: begin
+  			v1_x = x_model_v1;
+				v1_y = y_model_v1;
+				v1_z = z_model_v1;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_10;
+				v2_y = MVP_11;
+				v2_z = MVP_12;
+				v2_w = MVP_13;
+  		end
+  		44: begin
+  			v1_x = x_model_v1;
+				v1_y = y_model_v1;
+				v1_z = z_model_v1;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_20;
+				v2_y = MVP_21;
+				v2_z = MVP_22;
+				v2_w = MVP_23;
+  		end
+  		45: begin
+  			v1_x = x_model_v1;
+				v1_y = y_model_v1;
+				v1_z = z_model_v1;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_30;
+				v2_y = MVP_31;
+				v2_z = MVP_32;
+				v2_w = MVP_33;
+  		end
+  		46: begin
+  			v1_x = x_model_v2;
+				v1_y = y_model_v2;
+				v1_z = z_model_v2;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_00;
+				v2_y = MVP_01;
+				v2_z = MVP_02;
+				v2_w = MVP_03;
+  		end
+  		47: begin
+  			v1_x = x_model_v2;
+				v1_y = y_model_v2;
+				v1_z = z_model_v2;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_10;
+				v2_y = MVP_11;
+				v2_z = MVP_12;
+				v2_w = MVP_13;
+  		end
+  		48: begin
+  			v1_x = x_model_v2;
+				v1_y = y_model_v2;
+				v1_z = z_model_v2;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_20;
+				v2_y = MVP_21;
+				v2_z = MVP_22;
+				v2_w = MVP_23;
+  		end
+  		49: begin
+  			v1_x = x_model_v2;
+				v1_y = y_model_v2;
+				v1_z = z_model_v2;
+				v1_w = 16'sb0000_0001_0000_0000;
+				v2_x = MVP_30;
+				v2_y = MVP_31;
+				v2_z = MVP_32;
+				v2_w = MVP_33;
+  		end
+  		// state 177-178 , rot light world
+  		177: begin
+  			v1_x = light_x;
+				v1_y = light_y;
+				v1_z = light_z;
+				v1_w = 16'sb0;
+				v2_x = cosLight;
+				v2_y = 16'sb0;
+				v2_z = sinLight;
+				v2_w = 16'sb0;
+  		end
+  		178: begin
+  			v1_x = light_x;
+				v1_y = light_y;
+				v1_z = light_z;
+				v1_w = 16'sb0;
+				v2_x = ~sinLight + 16'sb0000_0000_0000_0001;	
+				v2_y = 16'sb0;
+				v2_z = cosLight;
+				v2_w = 16'sb0;
+  		end
+
+  		// state 191-206 for [M*VP], [VP] fix
+  		191: begin
+  			v1_x = M_00;
+				v1_y = M_10;
+				v1_z = M_20;
+				v1_w = M_30;
+				v2_x = 16'sh020f;
+				v2_y = 0;
+				v2_z = 0;
+				v2_w = 0;
+  		end
+  		192: begin
+  			v1_x = M_01;
+				v1_y = M_11;
+				v1_z = M_21;
+				v1_w = M_31;
+				v2_x = 16'sh020f;
+				v2_y = 0;
+				v2_z = 0;
+				v2_w = 0;
+  		end
+  		193: begin
+  			v1_x = M_02;
+				v1_y = M_12;
+				v1_z = M_22;
+				v1_w = M_32;
+				v2_x = 16'sh020f;
+				v2_y = 0;
+				v2_z = 0;
+				v2_w = 0;
+  		end
+  		194: begin
+  			v1_x = M_03;
+				v1_y = M_13;
+				v1_z = M_23;
+				v1_w = M_33;
+				v2_x = 16'sh020f;
+				v2_y = 0;
+				v2_z = 0;
+				v2_w = 0;
+  		end
+  		195: begin
+  			v1_x = M_00;
+				v1_y = M_10;
+				v1_z = M_20;
+				v1_w = M_30;
+				v2_x = 0;
+				v2_y = 16'sh02c0;
+				v2_z = 0;
+				v2_w = 0;
+  		end
+  		196: begin
+  			v1_x = M_01;
+				v1_y = M_11;
+				v1_z = M_21;
+				v1_w = M_31;
+				v2_x = 0;
+				v2_y = 16'sh02c0;
+				v2_z = 0;
+				v2_w = 0;
+  		end
+  		197: begin
+  			v1_x = M_02;
+				v1_y = M_12;
+				v1_z = M_22;
+				v1_w = M_32;
+				v2_x = 0;
+				v2_y = 16'sh02c0;
+				v2_z = 0;
+				v2_w = 0;
+  		end
+  		198: begin
+  			v1_x = M_03;
+				v1_y = M_13;
+				v1_z = M_23;
+				v1_w = M_33;
+				v2_x = 0;
+				v2_y = 16'sh02c0;
+				v2_z = 0;
+				v2_w = 0;
+  		end
+  		199: begin
+  			v1_x = M_00;
+				v1_y = M_10;
+				v1_z = M_20;
+				v1_w = M_30;
+				v2_x = 0;
+				v2_y = 0;
+				v2_z = 16'shfec9;
+				v2_w = 16'sh1a57;
+  		end
+  		200: begin
+  			v1_x = M_01;
+				v1_y = M_11;
+				v1_z = M_21;
+				v1_w = M_31;
+				v2_x = 0;
+				v2_y = 0;
+				v2_z = 16'shfec9;
+				v2_w = 16'sh1a57;
+  		end
+  		201: begin
+  			v1_x = M_02;
+				v1_y = M_12;
+				v1_z = M_22;
+				v1_w = M_32;
+				v2_x = 0;
+				v2_y = 0;
+				v2_z = 16'shfec9;
+				v2_w = 16'sh1a57;
+  		end
+  		202: begin
+  			v1_x = M_03;
+				v1_y = M_13;
+				v1_z = M_23;
+				v1_w = M_33;
+				v2_x = 0;
+				v2_y = 0;
+				v2_z = 16'shfec9;
+				v2_w = 16'sh1a57;
+  		end
+  		203: begin
+  			v1_x = M_00;
+				v1_y = M_10;
+				v1_z = M_20;
+				v1_w = M_30;
+				v2_x = 0;
+				v2_y = 0;
+				v2_z = 16'shff01;
+				v2_w = 16'sh27d8;
+  		end
+  		204: begin
+  			v1_x = M_01;
+				v1_y = M_11;
+				v1_z = M_21;
+				v1_w = M_31;
+				v2_x = 0;
+				v2_y = 0;
+				v2_z = 16'shff01;
+				v2_w = 16'sh27d8;
+  		end
+  		205: begin
+  			v1_x = M_02;
+				v1_y = M_12;
+				v1_z = M_22;
+				v1_w = M_32;
+				v2_x = 0;
+				v2_y = 0;
+				v2_z = 16'shff01;
+				v2_w = 16'sh27d8;
+  		end
+  		206: begin
+  			v1_x = M_03;
+				v1_y = M_13;
+				v1_z = M_23;
+				v1_w = M_33;
+				v2_x = 0;
+				v2_y = 0;
+				v2_z = 16'shff01;
+				v2_w = 16'sh27d8;
+  		end
+
+
+  		default: begin
+  			v1_x = 0;
+				v1_y = 0;
+				v1_z = 0;
+				v1_w = 0;
+				v2_x = 0;
+				v2_y = 0;
+				v2_z = 0;
+				v2_w = 0;
+  		end
+  	endcase
+  end
+
+
+
+	always @(posedge clk) begin
+    if(!reset) begin
+    	fsm_state <= 0;
+    	//
+    	vsfs_addr <= 0;
+    	vsfs_data_in <= 0;
+    	vsfs_start_read <= 0;
+    	vsfs_start_write <= 0;
+    	vsfs_stop_txn <= 0;
+    	do_swap <= 0;
+    	vsfs_running <= 0;
+    	// mul, div
+			div_a <= 0;
+			div_b <= 0;
+			div_start <= 0;
+			div2_a <= 0;
+			div2_b <= 0;
+			div2_start <= 0;
+			mul_a <= 0;
+			mul_b <= 0;
+			mul_start <= 0;
+			dot_start <= 0;
+    	//
+			M_00 <= 0;					// Q8.8
+			M_01 <= 0;
+			M_02 <= 0;
+			M_03 <= 0;
+			M_10 <= 0;					
+			M_11 <= 0;
+			M_12 <= 0;
+			M_13 <= 0;
+			M_20 <= 0;					
+			M_21 <= 0;
+			M_22 <= 0;
+			M_23 <= 0;
+			M_30 <= 0;					
+			M_31 <= 0;
+			M_32 <= 0;
+			M_33 <= 0;
+			MVP_00 <= 0;					// Q8.8
+			MVP_01 <= 0;
+			MVP_02 <= 0;
+			MVP_03 <= 0;
+			MVP_10 <= 0;					
+			MVP_11 <= 0;
+			MVP_12 <= 0;
+			MVP_13 <= 0;
+			MVP_20 <= 0;					
+			MVP_21 <= 0;
+			MVP_22 <= 0;
+			MVP_23 <= 0;
+			MVP_30 <= 0;					
+			MVP_31 <= 0;
+			MVP_32 <= 0;
+			MVP_33 <= 0;
+			//
+			manualRot <= 0;
+			sine_angle <= 0;
+			rotY_angle <= 0;		
+			rotY_angle_90 <= 0;	
+			rotX_angle <= 0;		
+			rotX_angle_90 <= 0;		
+			rotY_light <= 0;		
+			rotY_light_90 <= 0;	
+			translate_z <= 0;				
+			cosTheta <= 0;				
+			sinTheta <= 0;
+			cosPhi <= 0;							
+			sinPhi <= 0;
+			cosLight <= 0;							
+			sinLight <= 0;
+			cosTheta_sinPhi <= 0;		// Q8.8
+			sinTheta_cosPhi <= 0;
+			cosTheta_cosPhi <= 0;		
+			sinTheta_sinPhi <= 0;
+			sinTheta_Tz <= 0;				
+			cosTheta_sinPhi_Tz <= 0;
+			cosTheta_cosPhi_Tz <= 0;
+			//
+    	read_delay <= 0;
+    	numread <= 0;
+    	tri_idx <= 0;
+    	// tri_xyz[10:0]				 
+    	//
+    	x_model_v0 <= 0;				// Q8.8 from file
+			x_model_v1 <= 0;
+			x_model_v2 <= 0;
+			y_model_v0 <= 0;				
+			y_model_v1 <= 0;
+			y_model_v2 <= 0;
+			z_model_v0 <= 0;				
+			z_model_v1 <= 0;
+			z_model_v2 <= 0;
+			v0_u <= 0;
+			v0_v <= 0;
+			v1_u <= 0;
+			v1_v <= 0;
+			v2_u <= 0;
+			v2_v <= 0;
+			x_clip_v0 <= 0;
+			x_clip_v1 <= 0;
+			x_clip_v2 <= 0;
+			y_clip_v0 <= 0;
+			y_clip_v1 <= 0;
+			y_clip_v2 <= 0;
+			z_clip_v0 <= 0;
+			z_clip_v1 <= 0;
+			z_clip_v2 <= 0;
+			w_clip_v0 <= 0;
+			w_clip_v1 <= 0;
+			w_clip_v2 <= 0;
+			campos_x <= 0;								
+			campos_y <= 0;
+			campos_z <= 16'sb0010_1000_0000_0000;	// cam in model, init to cam in world
+			nx <= 0;								
+			ny <= 0;
+			nz <= 0;	
+			//light_x <= 16'sb0000_0000_1011_0101;	// light in world, init to (0.707,0.707,0)
+			//light_y <= 16'sb0000_0000_1011_0101;	
+			//light_z <= 16'sb0000_0000_0000_0000;
+			light_x <= 16'sb0000_0000_0000_0000;	// light in world, init to (0,0,1)
+			light_y <= 16'sb0000_0000_0000_0000;	
+			light_z <= 16'sb0000_0001_0000_0000;
+			lightW_x <= 0;	
+			lightW_y <= 0;	
+			lightW_z <= 0;									
+			lightM_x <= 0;								
+			lightM_y <= 0;		
+			lightM_z <= 0;	
+			viewdir_x <= 0;								
+			viewdir_y <= 0;
+			viewdir_z <= 0;	
+			tri_color <= 0;
+			shade_color <= 0;
+			x_screen_v0 <= 0;			
+			x_screen_v1 <= 0;
+			x_screen_v2 <= 0;
+			y_screen_v0 <= 0;
+			y_screen_v1 <= 0;
+			y_screen_v2 <= 0;
+			z_screen_v0 <= 0;			
+			z_screen_v1 <= 0;
+			z_screen_v2 <= 0;
+			bboxMin_X <= 0;				
+			bboxMin_Y <= 0;
+			bboxMax_X <= 0;
+			bboxMax_Y <= 0;
+			//
+			e0_init <= 0;					
+			e1_init <= 0;
+			e2_init <= 0;
+			// compute e0_init
+			tmp_ei_mul1 <= 0;
+			tmp_ei_mul2 <= 0;
+			// bar, denom
+			denom <= 0;
+			bar_ix <= 0;
+	    bar_ix_dy <= 0;
+	    bar_ix_dx <= 0;
+			bar_iy <= 0;
+	    bar_iy_dy <= 0;
+	    bar_iy_dx <= 0;
+	    bar_iz <= 0;
+	    bar_iz_dy <= 0;
+	    bar_iz_dx <= 0;
+	    //
+	    z_bar <= 0;
+	    z_bar_dx <= 0;
+	    z_bar_dy <= 0;
+	    u_bar <= 0;// Q14.8 (for neg/>1 out of tri bar) -> Q8.0 when sampling tex
+		  u_bar_dx <= 0;
+		  u_bar_dy <= 0;
+		  v_bar <= 0;					
+		  v_bar_dx <= 0;
+		  v_bar_dy <= 0;
+		  db_texel <= 0;
+	    //Z_buffer[3:0], C_buffer[3:0], texel [3:0]
+	    pixel_y <= 0;
+  		pixel_x <= 0;
+  		pixel_z <= 0;
+  		pixel_u <= 0;
+  		pixel_v <= 0;
+  		pixel_u8 <= 0;
+  		e0 <= 0;
+  		e1 <= 0;
+  		e2 <= 0;
+    end else begin
+			case (fsm_state)
+			///////////////////////////////
+			// 0. perframe, state [140-250]
+				0: begin
+					do_swap <= 0;
+					vsfs_running <= 0;
+
+					// enable manualRot
+					if ((manualRot == 0) && (gamepad_input != 0)) begin
+						manualRot <= 1;
+					end
+					fsm_state <= 140;
+				end
+				1: begin
+					// debug black hole state,
+					fsm_state <= 1;
+				end
+
+				//	- set [M]
+				140: begin
+					// -- set angle from input, manual/auto
+					if(manualRot == 1) begin
+						// rotX +-
+						if(gamepad_input[0] == 1)begin
+							if(rotX_angle > 355)begin
+								rotX_angle <= 0;
+							end else begin
+								rotX_angle <= rotX_angle + 4;
+							end
+						end else if(gamepad_input[1] == 1)begin
+							if(rotX_angle == 0)begin
+								rotX_angle <= 356;
+							end else begin
+								rotX_angle <= rotX_angle - 4;
+							end
+						end
+						// rotY
+						if(gamepad_input[2] == 1)begin
+							if(rotY_angle > 355)begin
+								rotY_angle <= 0;
+							end else begin
+								rotY_angle <= rotY_angle + 4;
+							end
+						end else if(gamepad_input[3] == 1)begin
+							if(rotY_angle == 0)begin
+								rotY_angle <= 356;
+							end else begin
+								rotY_angle <= rotY_angle - 4;
+							end
+						end
+						// tran Z
+						if(gamepad_input[4] == 1)begin
+							if(translate_z > 120)begin
+								translate_z <= 120;
+							end else begin
+								translate_z <= translate_z + 2;
+							end
+						end else if(gamepad_input[5] == 1)begin
+							if(translate_z < -120)begin
+								translate_z <= -120;
+							end else begin
+								translate_z <= translate_z - 2;
+							end
+						end
+						// rotLight
+						if(gamepad_input[6] == 1)begin
+							if(rotY_light > 355)begin
+								rotY_light <= 0;
+							end else begin
+								rotY_light <= rotY_light + 4;
+							end
+						end else if(gamepad_input[7] == 1)begin
+							if(rotY_light == 0)begin
+								rotY_light <= 356;
+							end else begin
+								rotY_light <= rotY_light - 4;
+							end
+						end
+					end else begin
+						if(rotY_angle > 355)begin
+							rotY_angle <= 0;
+						end else begin
+							rotY_angle <= rotY_angle + 4;
+						end
+					end	
+					fsm_state <= 141;
+				end
+				141: begin
+					// -- fixCos(i) = fixSin(i + 90)
+					if(rotY_angle < 270)begin
+						rotY_angle_90 <= rotY_angle + 90;
+					end else begin
+						rotY_angle_90 <= rotY_angle - 270;
+					end
+					if(rotX_angle < 270)begin
+						rotX_angle_90 <= rotX_angle + 90;
+					end else begin
+						rotX_angle_90 <= rotX_angle - 270;
+					end
+					if(rotY_light < 270)begin
+						rotY_light_90 <= rotY_light + 90;
+					end else begin
+						rotY_light_90 <= rotY_light - 270;
+					end
+					fsm_state <= 142;
+				end
+				142: begin
+					// -- sinPhi
+					if(rotX_angle == 90)begin
+						sinPhi <= 16'sb0000_0001_0000_0000;
+						fsm_state <= 146;
+					end else if(rotX_angle == 270) begin
+						sinPhi <= 16'sb1111_1111_0000_0000;
+						fsm_state <= 146;
+					end else begin
+						fsm_state <= 143;
+					end
+				end
+				143: begin
+					if(rotX_angle < 90) begin
+						sine_angle <= rotX_angle;
+					end else if(rotX_angle < 180) begin
+						sine_angle <= 180 - rotX_angle;
+					end else if(rotX_angle < 270) begin
+						sine_angle <= rotX_angle - 180;
+					end else begin
+						sine_angle <= 360 - rotX_angle;
+					end
+					fsm_state <= 144;
+				end
+				144: begin
+					sinPhi <= {8'b0,sine_value};
+					fsm_state <= 145;
+				end
+				145: begin
+					if(rotX_angle >= 180) begin
+						sinPhi <= ~sinPhi + 16'sb0000_0000_0000_0001;	
+					end
+					fsm_state <= 146;
+				end
+				146: begin
+					// -- cosPhi
+					if(rotX_angle_90 == 90)begin
+						cosPhi <= 16'sb0000_0001_0000_0000;
+						fsm_state <= 151;
+					end else if(rotX_angle_90 == 270) begin
+						cosPhi <= 16'sb1111_1111_0000_0000;
+						fsm_state <= 151;
+					end else begin
+						fsm_state <= 147;
+					end
+				end
+				147: begin
+					if(rotX_angle_90 < 90) begin
+						sine_angle <= rotX_angle_90;
+					end else if(rotX_angle_90 < 180) begin
+						sine_angle <= 180 - rotX_angle_90;
+					end else if(rotX_angle_90 < 270) begin
+						sine_angle <= rotX_angle_90 - 180;
+					end else begin
+						sine_angle <= 360 - rotX_angle_90;
+					end
+
+					fsm_state <= 148;
+				end
+				148: begin
+					cosPhi <= {8'b0,sine_value};
+					fsm_state <= 149;
+				end
+				149: begin
+					if(rotX_angle_90 >= 180) begin
+						cosPhi <= ~cosPhi + 16'sb0000_0000_0000_0001;	
+					end
+					fsm_state <= 151;
+				end
+				// free state 150
+				151: begin
+					// -- sinTheta
+					if(rotY_angle == 90)begin
+						sinTheta <= 16'sb0000_0001_0000_0000;
+						fsm_state <= 155;
+					end else if(rotY_angle == 270) begin
+						sinTheta <= 16'sb1111_1111_0000_0000;
+						fsm_state <= 155;
+					end else begin
+						fsm_state <= 152;
+					end
+				end
+				152: begin
+					if(rotY_angle < 90) begin
+						sine_angle <= rotY_angle;
+					end else if(rotY_angle < 180) begin
+						sine_angle <= 180 - rotY_angle;
+					end else if(rotY_angle < 270) begin
+						sine_angle <= rotY_angle - 180;
+					end else begin
+						sine_angle <= 360 - rotY_angle;
+					end
+					fsm_state <= 153;
+				end
+				153: begin
+					sinTheta <= {8'b0,sine_value};
+					fsm_state <= 154;
+				end
+				154: begin
+					if(rotY_angle >= 180) begin
+						sinTheta <= ~sinTheta + 16'sb0000_0000_0000_0001;	
+					end
+					fsm_state <= 155;
+				end
+				155: begin
+					// -- cosTheta
+					if(rotY_angle_90 == 90)begin
+						cosTheta <= 16'sb0000_0001_0000_0000;
+						fsm_state <= 159;
+					end else if(rotY_angle_90 == 270) begin
+						cosTheta <= 16'sb1111_1111_0000_0000;
+						fsm_state <= 159;
+					end else begin
+						fsm_state <= 156;
+					end
+				end
+				156: begin
+					if(rotY_angle_90 < 90) begin
+						sine_angle <= rotY_angle_90;
+					end else if(rotY_angle_90 < 180) begin
+						sine_angle <= 180 - rotY_angle_90;
+					end else if(rotY_angle_90 < 270) begin
+						sine_angle <= rotY_angle_90 - 180;
+					end else begin
+						sine_angle <= 360 - rotY_angle_90;
+					end
+
+					fsm_state <= 157;
+				end
+				157: begin
+					cosTheta <= {8'b0,sine_value};
+					fsm_state <= 158;
+				end
+				158: begin
+					if(rotY_angle_90 >= 180) begin
+						cosTheta <= ~cosTheta + 16'sb0000_0000_0000_0001;	
+					end
+					fsm_state <= 159;
+				end
+
+				// -- 7 mul sin.cos.t
+				//		- Q8.8 -> Q8.14, Q8.14 x Q8.14 = Q16.28 -> Q8.8
+				//		- Tz: Q8.0 -> Q8.14
+				159: begin
+					mul_a <= {cosTheta,6'b0};				// Q8.8 -> Q8.14
+					mul_b <= {sinPhi,6'b0};			
+					mul_start <= 1;
+					fsm_state <= 160;
+				end
+				160: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						cosTheta_sinPhi <= mul_result[35:20];							
+						mul_a <= {sinTheta,6'b0};		
+						mul_b <= {cosPhi,6'b0};
+						mul_start <= 1;
+						fsm_state <= 161;
+					end
+				end
+				161: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						sinTheta_cosPhi <= mul_result[35:20];							
+						mul_a <= {cosTheta,6'b0};		
+						mul_b <= {cosPhi,6'b0};	
+						mul_start <= 1;
+						fsm_state <= 162;
+					end
+				end
+				162: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						cosTheta_cosPhi <= mul_result[35:20];							
+						mul_a <= {sinTheta,6'b0};		
+						mul_b <= {sinPhi,6'b0};	
+						mul_start <= 1;
+						fsm_state <= 163;
+					end
+				end
+				163: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						sinTheta_sinPhi <= mul_result[35:20];	
+						mul_a <= {sinTheta,6'b0};		
+						mul_b <= {translate_z,14'b0};						// Tz: Q8.0 -> Q8.14
+						mul_start <= 1;
+						fsm_state <= 164;
+					end
+				end
+				164: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						sinTheta_Tz <= mul_result[35:20];	
+						mul_a <= {cosTheta_sinPhi,6'b0};		
+						mul_b <= {translate_z,14'b0};						
+						mul_start <= 1;
+						fsm_state <= 165;
+					end
+				end
+				165: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						cosTheta_sinPhi_Tz <= mul_result[35:20];	
+						mul_a <= {cosTheta_cosPhi,6'b0};		
+						mul_b <= {translate_z,14'b0};						
+						mul_start <= 1;
+						fsm_state <= 166;
+					end
+				end
+				166: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						cosTheta_cosPhi_Tz <= mul_result[35:20];	
+						fsm_state <= 167;
+					end
+				end
+				167: begin
+						M_00 <= cosTheta;					// Q8.8
+						M_01 <= sinTheta_sinPhi;
+						M_02 <= sinTheta_cosPhi;
+						M_03 <= 0;
+						M_10 <= 0;					
+						M_11 <= cosPhi;
+						M_12 <= ~sinPhi + 16'sb0000_0000_0000_0001;	
+						M_13 <= 0;
+						M_20 <= ~sinTheta + 16'sb0000_0000_0000_0001;			
+						M_21 <= cosTheta_sinPhi;
+						M_22 <= cosTheta_cosPhi;
+						M_23 <= {translate_z,8'sb0};
+						M_30 <= 0;					
+						M_31 <= 0;
+						M_32 <= 0;
+						M_33 <= 16'sb0000_0001_0000_0000;
+
+						fsm_state <= 168;
+				end 
+				//	- dir light in world space, rot 1 axis
+				168: begin
+					// -- sinLight
+					if(rotY_light == 90)begin
+						sinLight <= 16'sb0000_0001_0000_0000;
+						fsm_state <= 172;
+					end else if(rotY_light == 270) begin
+						sinLight <= 16'sb1111_1111_0000_0000;
+						fsm_state <= 172;
+					end else begin
+						fsm_state <= 169;
+					end
+				end
+				169: begin
+					if(rotY_light < 90) begin
+						sine_angle <= rotY_light;
+					end else if(rotY_light < 180) begin
+						sine_angle <= 180 - rotY_light;
+					end else if(rotY_light < 270) begin
+						sine_angle <= rotY_light - 180;
+					end else begin
+						sine_angle <= 360 - rotY_light;
+					end
+					fsm_state <= 170;
+				end
+				170: begin
+					sinLight <= {8'b0,sine_value};
+					fsm_state <= 171;
+				end
+				171: begin
+					if(rotY_light >= 180) begin
+						sinLight <= ~sinLight + 16'sb0000_0000_0000_0001;	
+					end
+					fsm_state <= 172;
+				end
+				172: begin
+					// -- cosLight
+					if(rotY_light_90 == 90)begin
+						cosLight <= 16'sb0000_0001_0000_0000;
+						fsm_state <= 176;
+					end else if(rotY_light_90 == 270) begin
+						cosLight <= 16'sb1111_1111_0000_0000;
+						fsm_state <= 176;
+					end else begin
+						fsm_state <= 173;
+					end
+				end
+				173: begin
+					if(rotY_light_90 < 90) begin
+						sine_angle <= rotY_light_90;
+					end else if(rotY_light_90 < 180) begin
+						sine_angle <= 180 - rotY_light_90;
+					end else if(rotY_light_90 < 270) begin
+						sine_angle <= rotY_light_90 - 180;
+					end else begin
+						sine_angle <= 360 - rotY_light_90;
+					end
+
+					fsm_state <= 174;
+				end
+				174: begin
+					cosLight <= {8'b0,sine_value};
+					fsm_state <= 175;
+				end
+				175: begin
+					if(rotY_light_90 >= 180) begin
+						cosLight <= ~cosLight + 16'sb0000_0000_0000_0001;	
+					end
+					fsm_state <= 176;
+				end
+				//	-- dot x,z to rot light
+				176: begin
+					lightW_y <= light_y;
+					dot_start <= 1;
+					fsm_state <= 177;
+				end
+				177: begin
+					dot_start <= 0;
+					if (dot_done) begin
+						lightW_x <= dot_result[15:0];
+						dot_start <= 1;
+						fsm_state <= 178;
+					end
+				end 
+				178: begin
+					dot_start <= 0;
+					if (dot_done) begin
+						lightW_z <= dot_result[15:0];
+						fsm_state <= 190;
+					end
+				end 
+				//free state 179-189
+				//	- set [M*VP]
+				190: begin
+						dot_start <= 1;
+						fsm_state <= 191;
+				end 
+				191: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_00 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 192;
+						end
+				end 
+				192: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_01 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 193;
+						end
+				end 
+				193: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_02 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 194;
+						end
+				end 
+				194: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_03 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 195;
+						end
+				end 
+				195: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_10 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 196;
+						end
+				end 
+				196: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_11 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 197;
+						end
+				end 
+				197: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_12 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 198;
+						end
+				end 
+				198: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_13 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 199;
+						end
+				end 
+				199: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_20 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 200;
+						end
+				end 
+				200: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_21 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 201;
+						end
+				end 
+				201: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_22 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 202;
+						end
+				end 
+				202: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_23 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 203;
+						end
+				end 
+				203: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_30 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 204;
+						end
+				end 
+				204: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_31 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 205;
+						end
+				end 
+				205: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_32 <= dot_result[15:0];
+							dot_start <= 1;
+							fsm_state <= 206;
+						end
+				end 
+				206: begin
+						dot_start <= 0;
+						if (dot_done) begin
+							MVP_33 <= dot_result[15:0];
+							fsm_state <= 210;
+						end
+				end 
+
+				//	- [M-1]
+				210: begin
+						M_00 <= cosTheta;					// Q8.8
+						M_01 <= 0;
+						M_02 <= ~sinTheta + 16'sb0000_0000_0000_0001;		
+						M_03 <= sinTheta_Tz;
+						M_10 <= sinTheta_sinPhi;					
+						M_11 <= cosPhi;
+						M_12 <= cosTheta_sinPhi;
+						M_13 <= ~cosTheta_sinPhi_Tz + 16'sb0000_0000_0000_0001;	
+						M_20 <= sinTheta_cosPhi;					
+						M_21 <= ~sinPhi + 16'sb0000_0000_0000_0001;	
+						M_22 <= cosTheta_cosPhi;
+						M_23 <= ~cosTheta_cosPhi_Tz + 16'sb0000_0000_0000_0001;	
+						M_30 <= 0;					
+						M_31 <= 0;
+						M_32 <= 0;
+						M_33 <= 16'sb0000_0001_0000_0000;
+
+						dot_start <= 1;
+						fsm_state <= 230;
+				end 
+
+				//	- [M-1]*campos
+				230: begin
+					dot_start <= 0;
+					if (dot_done) begin
+						campos_x <= dot_result[15:0];
+						dot_start <= 1;
+						fsm_state <= 231;
+					end
+				end 
+				231: begin
+					dot_start <= 0;
+					if (dot_done) begin
+						campos_y <= dot_result[15:0];
+						dot_start <= 1;
+						fsm_state <= 232;
+					end
+				end 
+				232: begin
+					dot_start <= 0;
+					if (dot_done) begin
+						campos_z <= dot_result[15:0];
+						dot_start <= 1;
+						fsm_state <= 240;
+					end
+				end 
+
+				//	- [M-1]*lightdir
+				240: begin
+					dot_start <= 0;
+					if (dot_done) begin
+						lightM_x <= dot_result[15:0];
+						dot_start <= 1;
+						fsm_state <= 241;
+					end
+				end 
+				241: begin
+					dot_start <= 0;
+					if (dot_done) begin
+						lightM_y <= dot_result[15:0];
+						dot_start <= 1;
+						fsm_state <= 242;
+					end
+				end 
+				242: begin
+					dot_start <= 0;
+					if (dot_done) begin
+						lightM_z <= dot_result[15:0];
+						fsm_state <= 250;
+					end
+				end 
+
+
+			// wait for start_vsfs, after clear z on the 1st subframe 
+				250: begin
+					if (start_vsfs) begin
+						tri_idx <= 0;
+						vsfs_running <= 1;
+						fsm_state <= 31;
+					end
+				end 
+			///////////////////////////////
+
+			// 1. for each tri
+				//	- READ tri
+				31: begin
+					if(tri_idx == numtri)begin
+						// wait a few clk before eof to send do_swap
+						if ((y == 524) && (x == 770)) begin
+							do_swap <= 1;
+							vsfs_running <= 0;
+							fsm_state <= 0;
+						end
+					end else begin
+						if (ram_notbusy) begin
+							vsfs_stop_txn <= 0;
+							vsfs_start_read <= 1;
+							//
+							vsfs_addr <= (has_tex)? 24'd153600 + {8'b0,tri_idx_addr_tex} :
+																			24'd153600 + {8'b0,tri_idx_addr};
+							numread <= 0;
+							read_delay <= 0;
+							fsm_state <= 32;
+						end
+					end
+				end
+				//   -- wait for the first flash data to be ready
+				32: begin
+					vsfs_start_read <= 0;
+          if(read_delay == 16) begin
+            read_delay <= 0;
+            tri_xyz[numread[5:2]][{~numread[1:0],2'b00} +: 4] <= spi_data;
+            numread <= 1;
+            fsm_state <= 33;
+          end 
+          else begin
+            read_delay <= read_delay + 1;
+          end
+				end
+				//   -- read 43 more 4bit OR 55 more (tex)
+        33: begin
+        	tri_xyz[numread[5:2]][{~numread[1:0],2'b00} +: 4] <= spi_data;
+          numread <= numread + 1;
+          //
+          if(numread == ((has_tex)? 55:43)) begin
+          	numread <= 0;
+            vsfs_stop_txn <= 1;
+            fsm_state <= 34;
+          end
+        end
+        //   -- chk normal -/+
+				34: begin
+					vsfs_stop_txn <= 0;
+					x_model_v0 <= tri_xyz[0] + 16'sb0000_1110_0000_0000;	
+					y_model_v0 <= tri_xyz[1] - 16'sb0000_1000_0000_0000;		
+					z_model_v0 <= tri_xyz[2];
+					x_model_v1 <= tri_xyz[3] + 16'sb0000_1110_0000_0000;	
+					y_model_v1 <= tri_xyz[4] - 16'sb0000_1000_0000_0000;	
+					z_model_v1 <= tri_xyz[5];
+					x_model_v2 <= tri_xyz[6] + 16'sb0000_1110_0000_0000;	
+					y_model_v2 <= tri_xyz[7] - 16'sb0000_1000_0000_0000;				
+					z_model_v2 <= tri_xyz[8];
+					tri_color <= tri_xyz[10][15:14];
+					nz <= (tri_xyz[10][13] == 1'b1)? {6'b1111_11,tri_xyz[10][13:4]} : {6'b0,tri_xyz[10][13:4]};
+					ny <= (tri_xyz[10][3] == 1'b1)? {6'b1111_11,tri_xyz[10][3:0],tri_xyz[9][15:10]} : {6'b0,tri_xyz[10][3:0],tri_xyz[9][15:10]};
+					nx <= (tri_xyz[9][9] == 1'b1)? {6'b1111_11,tri_xyz[9][9:0]} : {6'b0,tri_xyz[9][9:0]};
+					//
+					if(has_tex)begin
+						v0_u <= tri_xyz[11][7:0];
+						//v0_v <= tri_xyz[11][15:8];
+						v1_u <= tri_xyz[12][7:0];
+						//v1_v <= tri_xyz[12][15:8];
+						v2_u <= tri_xyz[13][7:0];
+						//v2_v <= tri_xyz[13][15:8];
+
+						// v0_u <= 8'd255 - tri_xyz[11][7:0];
+						 v0_v <= 8'd255 - tri_xyz[11][15:8];
+						// v1_u <= 8'd255 - tri_xyz[12][7:0];
+						 v1_v <= 8'd255 - tri_xyz[12][15:8];
+						// v2_u <= 8'd255 - tri_xyz[13][7:0];
+						 v2_v <= 8'd255 - tri_xyz[13][15:8];
+					end else begin
+						v0_u <= 0;
+						v0_v <= 0;
+						v1_u <= 0;
+						v1_v <= 0;
+						v2_u <= 0;
+						v2_v <= 0;
+					end
+
+					fsm_state <= 35;
+				end
+
+			///////////////////////////////
+			// 2. VS, 40 states
+			//	2.1 backface cullling: viewdir = campos - v1, dot(viewdir,n)
+			//	2.2 [MVP]*v, clip->NDC (div w), NDC->screen
+			//	2.3 dot(light,n)
+			
+			// 2.1 backface cullling
+				//	- viewdir = campos - v1
+				35:begin
+					viewdir_x <= campos_x - x_model_v0;
+					viewdir_y <= campos_y - y_model_v0;
+					viewdir_z <= campos_z - z_model_v0;
+
+					dot_start <= 1;
+					fsm_state <= 36;
+
+					//debug, print out model data
+					// tri_idx <= tri_idx + 1;
+					// fsm_state <= 31;
+				end
+				//	- dot(viewdir,n)
+				36:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						if (dot_result[17] == 1'b1)  begin  	   	  // backfacing
+							tri_idx <= tri_idx + 1;
+							fsm_state <= 31;
+
+							// debug
+							//fsm_state <= 37;
+						end else begin
+							fsm_state <= 37;
+						end
+					end
+				end
+				37: begin
+					dot_start <= 1;
+					fsm_state <= 38;
+				end
+
+			// 2.2 [MVP]*v, clip->NDC (div w), NDC->screen
+				// - clip = [MVP] * v
+				38:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						x_clip_v0 <= dot_result;
+						dot_start <= 1;
+						fsm_state <= 39;
+					end
+				end
+				39:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						y_clip_v0 <= dot_result;
+						dot_start <= 1;
+						fsm_state <= 40;
+					end
+				end
+				40:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						z_clip_v0 <= dot_result;
+						dot_start <= 1;
+						fsm_state <= 41;
+					end
+				end
+				41:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						// z cull, pass if a vertex is
+						//	- 10 < clip.w < 100 		Q10.8
+						//  - do this for all 3 vertices
+						if ((dot_result < 18'sb00_0110_0100_0000_0000) && (dot_result > 18'sb00_0000_1010_0000_0000)) begin
+							w_clip_v0 <= dot_result;
+							dot_start <= 1;
+							fsm_state <= 42;
+						end else begin
+							// cull, 
+							tri_idx <= tri_idx + 1;
+							fsm_state <= 31;
+						end
+					end
+				end
+				42:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						x_clip_v1 <= dot_result;
+						dot_start <= 1;
+						fsm_state <= 43;
+					end
+				end
+				43:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						y_clip_v1 <= dot_result;
+						dot_start <= 1;
+						fsm_state <= 44;
+					end
+				end
+				44:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						z_clip_v1 <= dot_result;
+						dot_start <= 1;
+						fsm_state <= 45;
+					end
+				end
+				45:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						// z cull
+						if ((dot_result < 18'sb00_0110_0100_0000_0000) && (dot_result > 18'sb00_0000_1010_0000_0000)) begin
+							w_clip_v1 <= dot_result;
+							dot_start <= 1;
+							fsm_state <= 46;
+						end else begin
+							// cull, 
+							tri_idx <= tri_idx + 1;
+							fsm_state <= 31;
+						end
+					end
+				end
+				46:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						x_clip_v2 <= dot_result;
+						dot_start <= 1;
+						fsm_state <= 47;
+					end
+				end
+				47:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						y_clip_v2 <= dot_result;
+						dot_start <= 1;
+						fsm_state <= 48;
+					end
+				end
+				48:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						z_clip_v2 <= dot_result;
+						dot_start <= 1;
+						fsm_state <= 49;
+					end
+				end
+				// - clip->NDC (div w), clip.xyz / clip.w
+				49:begin
+					dot_start <= 0;
+					if (dot_done) begin
+						// z cull
+						if ((dot_result < 18'sb00_0110_0100_0000_0000) && (dot_result > 18'sb00_0000_1010_0000_0000)) begin
+							w_clip_v2 <= dot_result;
+							// ndc = clip.xy / clip.w
+							// 		xy: Q10.8->Q16.16 -> Q16.16 = Q16.16/Q16.16 -> Q16.16->Q3.13
+							//		z:  Q10.8->Q16.16 -> Q16.16 = Q16.16/Q16.16 -> Q16.16->Q2.14 
+							div_a <= { {6{x_clip_v0[17]}}, x_clip_v0, 8'b0000_0000};
+							div_b <= { {6{w_clip_v0[17]}}, w_clip_v0, 8'b0000_0000};
+							div_start <= 1;
+							fsm_state <= 50;
+						end else begin
+							// cull, 
+							tri_idx <= tri_idx + 1;
+							fsm_state <= 31;
+						end
+					end
+				end
+				50:begin
+					div_start <= 0;
+					if (div_done) begin
+						x_model_v0 <= div_result[18:3];
+						div_a <= { {6{y_clip_v0[17]}}, y_clip_v0, 8'b0000_0000};
+						div_b <= { {6{w_clip_v0[17]}}, w_clip_v0, 8'b0000_0000};
+						div_start <= 1;
+						fsm_state <= 51;
+					end
+				end
+				51: begin
+					div_start <= 0;
+					if (div_done) begin
+						y_model_v0 <= div_result[18:3];
+						div_a <= { {6{x_clip_v1[17]}}, x_clip_v1, 8'b0000_0000};
+						div_b <= { {6{w_clip_v1[17]}}, w_clip_v1, 8'b0000_0000};
+						div_start <= 1;
+						fsm_state <= 52;
+					end
+				end
+				52: begin
+					div_start <= 0;
+					if (div_done) begin
+						x_model_v1 <= div_result[18:3];
+						div_a <= { {6{y_clip_v1[17]}}, y_clip_v1, 8'b0000_0000};
+						div_b <= { {6{w_clip_v1[17]}}, w_clip_v1, 8'b0000_0000};
+						div_start <= 1;
+						fsm_state <= 53;
+					end
+				end
+				53: begin
+					div_start <= 0;
+					if (div_done) begin
+						y_model_v1 <= div_result[18:3];
+						div_a <= { {6{x_clip_v2[17]}}, x_clip_v2, 8'b0000_0000};
+						div_b <= { {6{w_clip_v2[17]}}, w_clip_v2, 8'b0000_0000};
+						div_start <= 1;
+						fsm_state <= 54;
+					end
+				end
+				54: begin
+					div_start <= 0;
+					if (div_done) begin
+						x_model_v2 <= div_result[18:3];
+						div_a <= { {6{y_clip_v2[17]}}, y_clip_v2, 8'b0000_0000};
+						div_b <= { {6{w_clip_v2[17]}}, w_clip_v2, 8'b0000_0000};
+						div_start <= 1;
+						fsm_state <= 55;
+					end
+				end
+				55: begin
+					div_start <= 0;
+					if (div_done) begin
+						y_model_v2 <= div_result[18:3];
+						div_a <= { {6{z_clip_v0[17]}}, z_clip_v0, 8'b0000_0000};
+						div_b <= { {6{w_clip_v0[17]}}, w_clip_v0, 8'b0000_0000};
+						div_start <= 1;
+						fsm_state <= 56;
+
+						// - viewport culling xy in NDC
+						//		- find bbox in NDC space reuse bboxMax_X reg (use Q3.13_4)
+						bboxMin_X <= (x_model_v0 < x_model_v1)? {x_model_v0,4'b0} : {x_model_v1,4'b0};
+						bboxMin_Y <= (y_model_v0 < y_model_v1)? {y_model_v0,4'b0} : {y_model_v1,4'b0};
+						bboxMax_X <= (x_model_v0 > x_model_v1)? {x_model_v0,4'b0} : {x_model_v1,4'b0};
+						bboxMax_Y <= (y_model_v0 > y_model_v1)? {y_model_v0,4'b0} : {y_model_v1,4'b0};
+					end
+				end
+				56: begin
+					div_start <= 0;
+					if (div_done) begin
+						z_model_v0 <= div_result[17:2];
+						div_a <= { {6{z_clip_v1[17]}}, z_clip_v1, 8'b0000_0000};
+						div_b <= { {6{w_clip_v1[17]}}, w_clip_v1, 8'b0000_0000};
+						div_start <= 1;
+						fsm_state <= 57;
+
+						// - viewport culling xy in NDC
+						bboxMin_X <= (bboxMin_X < {x_model_v2,4'b0})? bboxMin_X : {x_model_v2,4'b0};
+						bboxMin_Y <= (bboxMin_Y < {y_model_v2,4'b0})? bboxMin_Y : {y_model_v2,4'b0};
+						bboxMax_X <= (bboxMax_X > {x_model_v2,4'b0})? bboxMax_X : {x_model_v2,4'b0};
+						bboxMax_Y <= (bboxMax_Y > {y_model_v2,4'b0})? bboxMax_Y : {y_model_v2,4'b0};
+					end
+				end
+				57: begin
+					div_start <= 0;
+					if (div_done) begin
+						// - viewport culling xy in NDC, pass if
+						//	- (bboxMax_X > -1) & (bboxMinX < 1) & (bboxMax_Y > -1) & (bboxMinY < 1)
+						if ((bboxMax_X > 20'sb111_0000_0000_0000_00000) && 
+							(bboxMin_X < 20'sb001_0000_0000_0000_00000) && 
+							(bboxMax_Y > 20'sb111_0000_0000_0000_00000) && 
+							(bboxMin_Y < 20'sb001_0000_0000_0000_00000)) begin
+							z_model_v1 <= div_result[17:2];
+							div_a <= { {6{z_clip_v2[17]}}, z_clip_v2, 8'b0000_0000};
+							div_b <= { {6{w_clip_v2[17]}}, w_clip_v2, 8'b0000_0000};
+							div_start <= 1;
+							fsm_state <= 58;
+						end else begin
+							// cull, 
+							tri_idx <= tri_idx + 1;
+							fsm_state <= 31;
+						end
+					end
+				end
+				58: begin
+					div_start <= 0;
+					if (div_done) begin
+						z_model_v2 <= div_result[17:2];
+						fsm_state <= 59;
+					end
+				end
+
+				// - NDC->screen, screen = [S] * ndc
+				59: begin
+					// screen = [S] * ndc
+					//		[-4,4] -> [-480,800],[-360,600]
+					//		Q3.13 -> Q11.5
+					// 		x_ndc * 160 + 160 = x_ndc << 7 + x_ndc << 5 + 160
+					// 				Q3.13 (x_ndc) -> Q10.6 (x_ndc << 7) -> Q11.5
+					//				Q3.13 (x_ndc) -> Q8.8 (x_ndc << 5) -> Q11.5
+					x_model_v0 <= {{1{x_model_v0[15]}}, x_model_v0[15:1]} + 
+												{{3{x_model_v0[15]}}, x_model_v0[15:3]} 
+												+ 16'sb000_1010_0000_00000;										// Q11.5 (160)
+					x_model_v1 <= {{1{x_model_v1[15]}}, x_model_v1[15:1]} + 
+												{{3{x_model_v1[15]}}, x_model_v1[15:3]} 
+												+ 16'sb000_1010_0000_00000;
+					x_model_v2 <= {{1{x_model_v2[15]}}, x_model_v2[15:1]} + 
+												{{3{x_model_v2[15]}}, x_model_v2[15:3]} 
+												+ 16'sb000_1010_0000_00000;
+					//		120 - y * 120. (128-8)
+					//				Q3.13 (y_ndc) -> Q10.6 (y_ndc << 7) -> Q11.5
+					//				Q3.13 (y_ndc) -> Q6.10 (y_ndc << 3) -> Q11.5
+					y_model_v0 <= {{1{y_model_v0[15]}}, y_model_v0[15:1]} -
+												{{5{y_model_v0[15]}}, y_model_v0[15:5]};	
+					y_model_v1 <= {{1{y_model_v1[15]}}, y_model_v1[15:1]} -
+												{{5{y_model_v1[15]}}, y_model_v1[15:5]};	
+					y_model_v2 <= {{1{y_model_v2[15]}}, y_model_v2[15:1]} -
+												{{5{y_model_v2[15]}}, y_model_v2[15:5]};	
+					//		z/2 + 0.5,   
+					//				Q2.14 (z_ndc) -> Q(z_ndc >> 1)
+									// [-1,1] -> [-0.5,0.5] -> [0,1]
+									// 01.xxxx -> 1.999					00.1111 (0.999)
+									// 01.0000 -> 1. 						00.1000 (0.5)
+									// 00.xxxx -> 0,0.99.  			00.0111 (0.499)
+									// //
+									// 11.xxxx -> -0.1,-0.99. 	11.1001 (-0.1)
+									// 11.0000 -> -1 						11.1000 (-0.5)
+									// 10.xxxx                  11.0xxx (-0.5 - -1)
+									// 10.0000 -> -1.999.       11.0000 (-1)
+					z_model_v0 <= {z_model_v0[15], z_model_v0[15:1]} +
+												+ 16'sb00_1000_0000_0000_00;									// Q2.14 (0.5)
+					z_model_v1 <= {z_model_v1[15], z_model_v1[15:1]} +
+												+ 16'sb00_1000_0000_0000_00;
+					z_model_v2 <= {z_model_v2[15], z_model_v2[15:1]} +
+												+ 16'sb00_1000_0000_0000_00;
+					fsm_state <= 60;
+				end
+				60: begin
+					// y = 120 - y, flip y (y=0 at the top, invert of opengl)
+					y_model_v0 <= 16'sb000_0111_1000_00000 - y_model_v0;				// Q11.5 (120)
+					y_model_v1 <= 16'sb000_0111_1000_00000 - y_model_v1;
+					y_model_v2 <= 16'sb000_0111_1000_00000 - y_model_v2;
+					fsm_state <= 61;
+				end
+				61: begin
+					// xy_ndc Q11.5 -> Q20.0 can have neg value
+					// z_ndc. Q2.14 -> zscreen Q2.20
+					x_screen_v0 <= {{9{x_model_v0[15]}},x_model_v0[15:5]};				
+					x_screen_v1 <= {{9{x_model_v1[15]}},x_model_v1[15:5]};
+					x_screen_v2 <= {{9{x_model_v2[15]}},x_model_v2[15:5]};
+					y_screen_v0 <= {{9{y_model_v0[15]}},y_model_v0[15:5]};
+					y_screen_v1 <= {{9{y_model_v1[15]}},y_model_v1[15:5]};
+					y_screen_v2 <= {{9{y_model_v2[15]}},y_model_v2[15:5]};
+					z_screen_v0 <= {z_model_v0,6'b0};			
+					z_screen_v1 <= {z_model_v1,6'b0};		
+					z_screen_v2 <= {z_model_v2,6'b0};		
+					fsm_state <= 62;
+				end
+				
+			// 2.3 dot(light,n)
+				62:begin
+					// if((z_screen_v0[21:20] != 0) || (z_screen_v1[21:20] != 0) || (z_screen_v2[21:20] != 0)) begin
+					// 	fsm_state <= 1;
+					// end else begin
+						dot_start <= 1;
+						fsm_state <= 63;
+					//end
+				end
+				63: begin
+					dot_start <= 0;
+					if (dot_done) begin
+						if (dot_result[9] == 1'b1) begin  	   	  		// backfacing 1x.xxx
+							// if (dot_result[8:6] == 3'b100) begin  			// 11.000 -> -1
+							// 	shade_color[2:1] <= 2'b11;
+							// end
+							// else if (dot_result[9:8] == 2'b10) begin 		// 10.xxx -> -1.xxx
+							// 	shade_color[2:1] <= 2'b11;
+							// end
+							// else begin
+							// 	shade_color[2:1] <= ~dot_result[7:6];						// 11.xxx -> -0.xxx
+							// end
+							shade_color <= 4'b0000;
+						end
+						else begin
+							// dot x tri_color
+							if (dot_result[8:5] == 4'b1000) begin 			// 01.000 -> 1
+								//shade_color <= 4'b0110;
+								shade_color <= {tri_color,2'b11};
+							end
+							else begin
+								//shade_color <= {1'b0,dot_result[7:6],1'b0};							// 0.000 - 0.111
+								shade_color <= {tri_color,dot_result[7:6]};
+							end
+						end
+
+						// also do bbox here
+						bboxMin_X <= (x_screen_v0 < x_screen_v1)? x_screen_v0 : x_screen_v1;
+						bboxMin_Y <= (y_screen_v0 < y_screen_v1)? y_screen_v0 : y_screen_v1;
+						bboxMax_X <= (x_screen_v0 > x_screen_v1)? x_screen_v0 : x_screen_v1;
+						bboxMax_Y <= (y_screen_v0 > y_screen_v1)? y_screen_v0 : y_screen_v1;
+
+						fsm_state <= 74;
+					end
+				end
+
+			///////////////////////////////
+
+			// 3. bbox
+				// x mul of 4, floor-Min, floor-Max (will do 3 more pixels)
+				74: begin
+					bboxMin_X <= (bboxMin_X < x_screen_v2)? bboxMin_X : x_screen_v2;
+					bboxMin_Y <= (bboxMin_Y < y_screen_v2)? bboxMin_Y : y_screen_v2;
+					bboxMax_X <= (bboxMax_X > x_screen_v2)? bboxMax_X : x_screen_v2;
+					bboxMax_Y <= (bboxMax_Y > y_screen_v2)? bboxMax_Y : y_screen_v2;
+					fsm_state <= 75;
+				end
+				75: begin
+					// max(viewportLeft, bboxMin_X), min(viewportRight, bboxMax_X)
+					bboxMin_X <= (bboxMin_X > 20'sd0 )? bboxMin_X : 20'sd0;
+					bboxMin_Y <= (bboxMin_Y > 20'sd0 )? bboxMin_Y : 20'sd0;
+					bboxMax_X <= (bboxMax_X < 20'sd319)? bboxMax_X : 20'sd319;
+					bboxMax_Y <= (bboxMax_Y < 20'sd239)? bboxMax_Y : 20'sd239;
+					fsm_state <= 76;
+				end
+				76: begin
+					bboxMin_X[1:0] <= 2'b00;
+					bboxMax_X[1:0] <= 2'b00;
+					fsm_state <= 77;
+				end
+
+			// 4.1 e0_init, e1_init, e2_init 
+				// e0_init = (bboxmin.x - pts[0].x)*(pts[1].y-pts[0].y) + (pts[0].y - bboxmin.y ) * (pts[1].x-pts[0].x);
+    		// e1_init = (bboxmin.x - pts[1].x)*(pts[2].y-pts[1].y) + (pts[1].y - bboxmin.y ) * (pts[2].x-pts[1].x);
+    		// e2_init = (bboxmin.x - pts[2].x)*(pts[0].y-pts[2].y) + (pts[2].y - bboxmin.y ) * (pts[0].x-pts[2].x);
+    		// 320x240x2 = 153,600. (largest tri not exceed 320x240)
+    		// Q20.2 x Q20.2 = Q40.4->Q20.0
+
+    		//	- e0_init
+				77: begin
+					mul_a <= {bboxMin_X - x_screen_v0,2'b00};				// bboxmin.x - pts[0].x
+					mul_b <= {y_screen_v1 - y_screen_v0,2'b00};			// pts[1].y-pts[0].y (a0)
+					mul_start <= 1;
+					fsm_state <= 78;
+				end
+				78: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						tmp_ei_mul1 <= mul_result[23:4];							// ready in 23clk for 20bit mul
+						mul_a <= {y_screen_v0 - bboxMin_Y,2'b00};			// pts[0].y - bboxmin.y
+						mul_b <= {x_screen_v1 - x_screen_v0,2'b00};		// pts[1].x-pts[0].x (b0)
+						mul_start <= 1;
+						fsm_state <= 79;
+					end
+				end
+				79: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						tmp_ei_mul2 <= mul_result[23:4];							// ready in 23clk for 20bit mul
+						fsm_state <= 80;
+					end 
+				end
+				//	- e1_init
+				80: begin
+					e0_init <= tmp_ei_mul2 + tmp_ei_mul1;						// fin e0_init
+					mul_a <= {bboxMin_X - x_screen_v1,2'b00};						
+					mul_b <= {y_screen_v2 - y_screen_v1,2'b00};			
+					mul_start <= 1;
+					fsm_state <= 81;
+				end
+				81: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						tmp_ei_mul1 <= mul_result[23:4];		
+						mul_a <= {y_screen_v1 - bboxMin_Y,2'b00};					
+						mul_b <= {x_screen_v2 - x_screen_v1,2'b00};	
+						mul_start <= 1;
+						fsm_state <= 82;
+					end
+				end
+				82: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						tmp_ei_mul2 <= mul_result[23:4];						// ready in 23clk for 20bit mul
+						fsm_state <= 83;
+					end
+				end
+				//	- e2_init
+				83: begin
+					e1_init <= tmp_ei_mul2 + tmp_ei_mul1;					// fin e1_init
+					mul_a <= {bboxMin_X - x_screen_v2,2'b00};						
+					mul_b <= {y_screen_v0 - y_screen_v2,2'b00};			
+					mul_start <= 1;
+					fsm_state <= 84;
+				end
+				84: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						tmp_ei_mul1 <= mul_result[23:4];		
+						mul_a <= {y_screen_v2 - bboxMin_Y,2'b00};					
+						mul_b <= {x_screen_v0 - x_screen_v2,2'b00};		
+						mul_start <= 1;
+						fsm_state <= 85;
+					end
+				end
+				85: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						tmp_ei_mul2 <= mul_result[23:4];		
+						fsm_state <= 86;
+					end 
+				end
+				86: begin
+					e2_init <= tmp_ei_mul2 + tmp_ei_mul1;				// fin e2_init
+					fsm_state <= 87;
+				end
+
+			// 4.2 denom
+				// Q20.0 denom_i = (y1-y2)(x0-x2)+(x2-x1)(y0-y2)
+				// Q2.20 denom = float2fix14(1.0f/denom_i);
+				// 320x240x2 = 153,600. (largest tri not exceed 320x240)
+				// 1/153,600 = 0.0000065 (< 1/2^20)  
+				87: begin
+						mul_a <= {y_screen_v1 - y_screen_v2,2'b00};			
+						mul_b <= {x_screen_v0 - x_screen_v2,2'b00};	
+						mul_start <= 1;
+						fsm_state <= 88;
+					end
+				88: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						tmp_ei_mul1 <= mul_result[23:4];		// ready in 23clk for 20bit mul
+						mul_a <= {y_screen_v0 - y_screen_v2,2'b00};		
+						mul_b <= {x_screen_v2 - x_screen_v1,2'b00};	
+						mul_start <= 1;
+						fsm_state <= 89;
+					end
+				end
+				89: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						tmp_ei_mul2 <= tmp_ei_mul1 + mul_result[23:4];		// denom_i
+						fsm_state <= 90;
+					end 
+				end
+				90: begin
+					// Q20.0->Q20.20 -> Q20.20/Q20.20 
+					div2_a <= { 20'b0000_0000_0000_0000_0001, 20'b0000_0000_0000_0000_0000};	// 1.0f/denom_i
+					div2_b <= { tmp_ei_mul2, 20'b0000_0000_0000_0000_0000};
+					div2_start <= 1;
+					fsm_state <= 91;
+				end
+				91: begin
+					div2_start <= 0;
+					if (div2_done) begin
+						// Q20.20->Q2.20
+						denom <= {div2_result[21:0]};
+						fsm_state <= 92;
+					end
+				end
+
+			//4.3 bar_ix, bar_iy, bar_iz  
+				// 	Q2.20 = (Q20.0->)Q20.2 * Q2.20
+				//	      = 500,000 * 0.000002 = 1
+				//        = 10,000 * 0.000002 = 0.02
+				//	Q2.20 = 500 * 0.000002 = 0.001, 2^10
+				//		  = 100 * 0.000002 = 0.0002, 2^16 = 0.000015
+				//		
+				//		bar_iy <= {(y2-y0)(bboxMin_X-x2)+(x0-x2)(bboxMin_Y-y2)} * denom;	// 3 mul
+				//		bar_iy_dy <= x0x2 * denom;		// 1 mul
+				//		bar_iy_dx <= y2y0 * denom;		// 1 mul
+				//		bar_iz <= {(y0-y1)(bboxMin_X-x0)+(x1-x0)(bboxMin_Y-y0)} * denom;	// 3 mul
+				//		bar_iz_dy <= x1x0 * denom;		// 1 mul
+				//		bar_iz_dx <= y0y1 * denom;		// 1 mul
+				//		bar_ix <= 1 - (bar_iy + bar_iz)
+				//			bar_ix <= {(y1-y2)(bboxMin_X-x2)+(x2-x1)(bboxMin_Y-y2)} * denom;
+				//		bar_ix_dy <= x2x1 * denom;
+				//		bar_ix_dx <= y1y2 * denom;
+
+				// 	denom Q2.20 
+				//	x_screen, bbox Q20.0 -> Q20.2
+				//	[-480,800)*[-360,600) under Q20.0
+				//. Q20.2 x Q20.2 = Q40.4 -> Q20.0 -> Q20.2
+				//	Q20.2 x Q2.20 = Q22.22 -> Q6.16 for bar
+
+				92: begin
+					mul_a <= {y_screen_v2 - y_screen_v0,2'b00};						
+					mul_b <= {bboxMin_X - x_screen_v2,2'b00};			
+					mul_start <= 1;
+					fsm_state <= 93;
+				end
+				93: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						tmp_ei_mul1 <= mul_result[23:4];							// Q40.4 -> Q20.0, ready in 23clk for 20bit mul
+						mul_a <= {x_screen_v0 - x_screen_v2,2'b00};		
+						mul_b <= {bboxMin_Y - y_screen_v2,2'b00};					
+						mul_start <= 1;
+						fsm_state <= 94;
+					end
+				end
+				94: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						mul_a <= {tmp_ei_mul1 + mul_result[23:4],2'b00};		// ready in 23clk for 20bit mul
+						mul_b <= denom;							
+						mul_start <= 1;
+						fsm_state <= 95;
+					end
+				end
+				95: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						bar_iy <= mul_result[27:6];									// Q22.22 -> Q6.16, ready in 23clk for 20bit mul
+						//
+						mul_a <= {x_screen_v0 - x_screen_v2,2'b00};		
+						mul_b <= denom;					
+						mul_start <= 1;
+						fsm_state <= 96;
+					end
+				end
+				96: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						bar_iy_dy <= mul_result[27:6];							// ready in 23clk for 20bit mul
+						//
+						mul_a <= {y_screen_v2 - y_screen_v0,2'b00};			
+						mul_b <= denom;					
+						mul_start <= 1;
+						fsm_state <= 97;
+					end
+				end
+				97: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						bar_iy_dx <= mul_result[27:6];							// Q6.16, Q2.20 is [23:2]
+						//
+						mul_a <= {y_screen_v0 - y_screen_v1,2'b00};						
+						mul_b <= {bboxMin_X - x_screen_v0,2'b00};				
+						mul_start <= 1;
+						fsm_state <= 98;
+					end
+				end
+				98: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						tmp_ei_mul1 <= mul_result[23:4];						// ready in 23clk for 20bit mul
+						mul_a <= {x_screen_v1 - x_screen_v0,2'b00};		
+						mul_b <= {bboxMin_Y - y_screen_v0,2'b00};					
+						mul_start <= 1;
+						fsm_state <= 99;
+					end
+				end
+				99: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						mul_a <= {tmp_ei_mul1 + mul_result[23:4],2'b00};		// ready in 23clk for 20bit mul
+						mul_b <= denom;							
+						mul_start <= 1;
+						fsm_state <= 100;
+					end
+				end
+				100: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						bar_iz <= mul_result[27:6];								// ready in 23clk for 20bit mul
+						//
+						mul_a <= {x_screen_v1 - x_screen_v0,2'b00};		
+						mul_b <= denom;					
+						mul_start <= 1;
+						fsm_state <= 101;
+					end
+				end
+				101: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						bar_iz_dy <= mul_result[27:6];							// ready in 23clk for 20bit mul
+						//
+						bar_ix <= bar_iy + bar_iz;
+						//
+						mul_a <= {y_screen_v0 - y_screen_v1,2'b00};			
+						mul_b <= denom;					
+						mul_start <= 1;
+						fsm_state <= 102;
+					end
+				end
+				102: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						bar_iz_dx <= mul_result[27:6];							// ready in 23clk for 20bit mul
+						//
+						bar_ix <= 22'b00_0001_0000_0000_0000_0000 - bar_ix;		// 1 in Q6.16
+						//
+						mul_a <= {x_screen_v2 - x_screen_v1,2'b00};		
+						mul_b <= denom;					
+						mul_start <= 1;
+						fsm_state <= 103;
+					end
+				end
+				103: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						bar_ix_dy <= mul_result[27:6];							// ready in 23clk for 20bit mul
+						//
+						mul_a <= {y_screen_v1 - y_screen_v2,2'b00};			
+						mul_b <= denom;					
+						mul_start <= 1;
+						fsm_state <= 104;
+					end
+				end
+				104: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						bar_ix_dx <= mul_result[27:6];							// ready in 23clk for 20bit mul
+						//
+						fsm_state <= 105;
+					end
+				end
+
+			//4.4 Z_bar: state 105-114
+				// 		z_bar = z_screen_v0*bar_ix + z_screen_v1*bar_iy + z_screen_v2*bar_iz
+				// 		z_bar_dx = z_screen_v0*bar_ix_dx + z_screen_v1*bar_iy_dx + z_screen_v2*bar_iz_dx
+				// 		z_bar_dy = z_screen_v0*bar_ix_dy + z_screen_v1*bar_iy_dy + z_screen_v2*bar_iz_dy
+				//
+				//		Q2.20 * Q6.16 = Q8.36 -> Q6.16 [41:20]  same bit select
+				105: begin
+					mul_a <= z_screen_v0;						
+					mul_b <= bar_ix;			
+					mul_start <= 1;
+					fsm_state <= 106;
+				end
+				106: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						z_bar <= mul_result[41:20];						
+						mul_a <= z_screen_v1;		
+						mul_b <= bar_iy;					
+						mul_start <= 1;
+						fsm_state <= 107;
+					end
+				end
+				107: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						z_bar <= z_bar + mul_result[41:20];						// ready in 23clk for 20bit mul
+						mul_a <= z_screen_v2;		
+						mul_b <= bar_iz;					
+						mul_start <= 1;
+						fsm_state <= 108;
+					end
+				end
+				108: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						z_bar <= z_bar + mul_result[41:20];						// ready in 23clk for 20bit mul
+						//
+						mul_a <= z_screen_v0;	
+						mul_b <= bar_ix_dx;					
+						mul_start <= 1;
+						fsm_state <= 109;
+					end
+				end
+				109: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						z_bar_dx <= mul_result[41:20];						// ready in 23clk for 20bit mul
+						mul_a <= z_screen_v1;		
+						mul_b <= bar_iy_dx;					
+						mul_start <= 1;
+						fsm_state <= 110;
+					end
+				end
+				110: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						z_bar_dx <= z_bar_dx + mul_result[41:20];						// ready in 23clk for 20bit mul
+						mul_a <= z_screen_v2;		
+						mul_b <= bar_iz_dx;					
+						mul_start <= 1;
+						fsm_state <= 111;
+					end
+				end
+				111: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						z_bar_dx <= z_bar_dx + mul_result[41:20];						// ready in 23clk for 20bit mul
+						//
+						mul_a <= z_screen_v0;		
+						mul_b <= bar_ix_dy;					
+						mul_start <= 1;
+						fsm_state <= 112;
+					end
+				end
+				112: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						z_bar_dy <= mul_result[41:20];						// ready in 23clk for 20bit mul
+						mul_a <= z_screen_v1;		
+						mul_b <= bar_iy_dy;					
+						mul_start <= 1;
+						fsm_state <= 113;
+					end
+				end
+				113: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						z_bar_dy <= z_bar_dy + mul_result[41:20];						// ready in 23clk for 20bit mul
+						mul_a <= z_screen_v2;		
+						mul_b <= bar_iz_dy;					
+						mul_start <= 1;
+						fsm_state <= 114;
+					end
+				end
+				114: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						z_bar_dy <= z_bar_dy + mul_result[41:20];						// ready in 23clk for 20bit mul
+						//
+						pixel_y <= bboxMin_Y[9:0];
+
+						if(has_tex)begin
+							// do uv*bar
+							fsm_state <= 2;
+						end else begin
+							// skip uv * bar
+							fsm_state <= 115;
+						end
+						
+					end
+				end
+			
+
+			//4.5 uv_bar: state 2-21
+				// 		u_bar = v0_u * bar_ix + v1_u * bar_iy + v2_u * bar_iz
+				// 		u_bar_dx = v0_u * bar_ix_dx + v1_u * bar_iy_dx + v2_u * bar_iz_dx
+				// 		u_bar_dy = v0_u * bar_ix_dy + v1_u * bar_iy_dy + v2_u * bar_iz_dy
+				//
+				//		not use
+				//		Q8.0 -> Q8.14 * Q6.16 = Q14.30 -> Q14.8 [43:22]
+				//		mul will treat uv as signed
+				//		Q8.0 -> Q9.13 * Q6.16 = Q15.29 -> Q15.7 [43:22]
+				//
+				//		use this one, percision dx,dy
+				//		Q8.0 -> Q9.13 * Q6.16 = Q15.29 -> Q10.12 [38:17]  
+				2: begin
+					mul_a <= {1'b0,v0_u,13'b0};						
+					mul_b <= bar_ix;			
+					mul_start <= 1;
+					fsm_state <= 3;
+				end
+				3: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						u_bar <= mul_result[38:17] ;						
+						mul_a <= {1'b0,v1_u,13'b0};				
+						mul_b <= bar_iy;					
+						mul_start <= 1;
+						fsm_state <= 4;
+					end
+				end
+				4: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						u_bar <= u_bar + mul_result[38:17];						// ready in 23clk for 20bit mul
+						mul_a <= {1'b0,v2_u,13'b0};				
+						mul_b <= bar_iz;					
+						mul_start <= 1;
+						fsm_state <= 5;
+					end
+				end
+				5: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						u_bar <= u_bar + mul_result[38:17];						// ready in 23clk for 20bit mul
+						//
+						mul_a <= {1'b0,v0_u,13'b0};			
+						mul_b <= bar_ix_dx;					
+						mul_start <= 1;
+						fsm_state <= 6;
+					end
+				end
+				6: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						u_bar_dx <= mul_result[38:17];						// ready in 23clk for 20bit mul
+						mul_a <= {1'b0,v1_u,13'b0};				
+						mul_b <= bar_iy_dx;					
+						mul_start <= 1;
+						fsm_state <= 7;
+					end
+				end
+				7: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						u_bar_dx <= u_bar_dx + mul_result[38:17];						// ready in 23clk for 20bit mul
+						mul_a <= {1'b0,v2_u,13'b0};			
+						mul_b <= bar_iz_dx;					
+						mul_start <= 1;
+						fsm_state <= 8;
+					end
+				end
+				8: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						u_bar_dx <= u_bar_dx + mul_result[38:17];						// ready in 23clk for 20bit mul
+						//
+						mul_a <= {1'b0,v0_u,13'b0};			
+						mul_b <= bar_ix_dy;					
+						mul_start <= 1;
+						fsm_state <= 9;
+					end
+				end
+				9: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						u_bar_dy <= mul_result[38:17];						// ready in 23clk for 20bit mul
+						mul_a <= {1'b0,v1_u,13'b0};				
+						mul_b <= bar_iy_dy;					
+						mul_start <= 1;
+						fsm_state <= 10;
+					end
+				end
+				10: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						u_bar_dy <= u_bar_dy + mul_result[38:17];						// ready in 23clk for 20bit mul
+						mul_a <= {1'b0,v2_u,13'b0};			
+						mul_b <= bar_iz_dy;					
+						mul_start <= 1;
+						fsm_state <= 11;
+					end
+				end
+				11: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						u_bar_dy <= u_bar_dy + mul_result[38:17];						// ready in 23clk for 20bit mul
+						//
+						fsm_state <= 12;
+					end
+				end
+				12: begin
+					mul_a <= {1'b0,v0_v,13'b0};								
+					mul_b <= bar_ix;			
+					mul_start <= 1;
+					fsm_state <= 13;
+				end
+				13: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						v_bar <= mul_result[38:17];						
+						mul_a <= {1'b0,v1_v,13'b0};			
+						mul_b <= bar_iy;					
+						mul_start <= 1;
+						fsm_state <= 14;
+					end
+				end
+				14: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						v_bar <= v_bar + mul_result[38:17];						// ready in 23clk for 20bit mul
+						mul_a <= {1'b0,v2_v,13'b0};				
+						mul_b <= bar_iz;					
+						mul_start <= 1;
+						fsm_state <= 15;
+					end
+				end
+				15: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						v_bar <= v_bar + mul_result[38:17];						// ready in 23clk for 20bit mul
+						//
+						mul_a <= {1'b0,v0_v,13'b0};			
+						mul_b <= bar_ix_dx;					
+						mul_start <= 1;
+						fsm_state <= 16;
+					end
+				end
+				16: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						v_bar_dx <= mul_result[38:17];						// ready in 23clk for 20bit mul
+						mul_a <= {1'b0,v1_v,13'b0};				
+						mul_b <= bar_iy_dx;					
+						mul_start <= 1;
+						fsm_state <= 17;
+					end
+				end
+				17: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						v_bar_dx <= v_bar_dx + mul_result[38:17];						// ready in 23clk for 20bit mul
+						mul_a <= {1'b0,v2_v,13'b0};				
+						mul_b <= bar_iz_dx;					
+						mul_start <= 1;
+						fsm_state <= 18;
+					end
+				end
+				18: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						v_bar_dx <= v_bar_dx + mul_result[38:17];						// ready in 23clk for 20bit mul
+						//
+						mul_a <= {1'b0,v0_v,13'b0};			
+						mul_b <= bar_ix_dy;					
+						mul_start <= 1;
+						fsm_state <= 19;
+					end
+				end
+				19: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						v_bar_dy <= mul_result[38:17];						// ready in 23clk for 20bit mul
+						mul_a <= {1'b0,v1_v,13'b0};				
+						mul_b <= bar_iy_dy;					
+						mul_start <= 1;
+						fsm_state <= 20;
+					end
+				end
+				20: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						v_bar_dy <= v_bar_dy + mul_result[38:17];						// ready in 23clk for 20bit mul
+						mul_a <= {1'b0,v2_v,13'b0};			
+						mul_b <= bar_iz_dy;					
+						mul_start <= 1;
+						fsm_state <= 21;
+					end
+				end
+				21: begin
+					mul_start <= 0;
+					if (mul_done) begin
+						v_bar_dy <= v_bar_dy + mul_result[38:17];						// ready in 23clk for 20bit mul
+						//
+						fsm_state <= 115;
+					end
+				end
+
+
+			//5. for pixel y in bbox
+				// - e0 = e0_init, z = z_bar / e0_init += dy, z_bar += z_bar_dy
+				115: begin
+					if (pixel_y > bboxMax_Y[9:0]) begin
+						tri_idx <= tri_idx + 1;
+						fsm_state <= 31;
+					end else begin
+						e0 <= e0_init;
+						e1 <= e1_init;
+						e2 <= e2_init;
+						pixel_z <= z_bar;
+						pixel_u <= u_bar;
+						pixel_v <= v_bar;
+						//
+						e0_init <= e0_init - (x_screen_v1 - x_screen_v0);
+						e1_init <= e1_init - (x_screen_v2 - x_screen_v1);
+						e2_init <= e2_init - (x_screen_v0 - x_screen_v2);
+						z_bar <= z_bar + z_bar_dy;
+						u_bar <= u_bar + u_bar_dy;
+						v_bar <= v_bar + v_bar_dy;
+
+						//shade_color <= tri_idx[3:0];
+						//
+						pixel_x <= bboxMin_X[9:0];
+						fsm_state <= 116;
+					end
+				end
+				// - for x in bbox (x < bboxMax_X)
+				//	- READ x4 Z (23 clk)
+				116: begin
+					if (pixel_x > bboxMax_X[9:0]) begin
+						fsm_state <= 255;
+					end else begin
+						if (ram_notbusy) begin
+							vsfs_stop_txn <= 0;
+							vsfs_start_read <= 1;
+							// y*320 + x + z_start
+							vsfs_addr <= {6'b0,pixel_y,8'b0} + {8'b0,pixel_y,6'b0} + {14'b0,pixel_x} + 76800;
+							numread <= 0;
+							read_delay <= 0;
+							fsm_state <= 117;
+						end
+					end
+				end
+				//   -- wait for the first flash data to be ready
+				117: begin
+					vsfs_start_read <= 0;
+          if(read_delay == 16) begin
+            read_delay <= 0;
+            Z_buffer[numread[2:1]][{~numread[0],2'b00} +: 4] <= spi_data;
+            numread <= 1;
+            fsm_state <= 118;
+          end 
+          else begin
+            read_delay <= read_delay + 1;
+          end
+				end
+				//   -- read 7 more 4bit
+				118: begin
+					Z_buffer[numread[2:1]][{~numread[0],2'b00} +: 4] <= spi_data;
+          numread <= numread + 1;
+          if(numread == 7)begin
+            numread <= 0;
+            vsfs_stop_txn <= 1;
+            fsm_state <= 119;
+          end
+				end
+				//	- READ x4 B (19 clk)
+				119: begin
+					vsfs_stop_txn <= 0;
+					vsfs_start_read <= 1;
+					// y * 160 + x/2 + (offset back[0])
+					vsfs_addr <= (evenframe)?{7'b0,pixel_y,7'b0} + {9'b0,pixel_y,5'b0} + {15'b0,pixel_x[9:1]} + 38400:
+                                	{7'b0,pixel_y,7'b0} + {9'b0,pixel_y,5'b0} + {15'b0,pixel_x[9:1]};
+					numread <= 0;
+					read_delay <= 0;
+					fsm_state <= 120;
+				end
+				//   -- wait for the first flash data to be ready
+				120: begin
+					vsfs_start_read <= 0;
+          if(read_delay == 16) begin
+            read_delay <= 0;
+            C_buffer[numread[1:0]] <= spi_data;
+            numread <= 1;
+            fsm_state <= 121;
+          end 
+          else begin
+            read_delay <= read_delay + 1;
+          end
+				end
+				//   -- read 3 more 4bit
+				121: begin
+					C_buffer[numread[1:0]] <= spi_data;
+          numread <= numread + 1;
+          if(numread == 3)begin
+            numread <= 0;
+            vsfs_stop_txn <= 1;
+
+            if(has_tex)begin
+            	// read texel x4
+            	fsm_state <= 211;
+            end else begin
+            	// skip read texel
+            	fsm_state <= 122;
+            end
+          end
+				end
+
+				// uv Q10.12 -> Q8.0 [19:12]
+				//	- READ x4 texel (35 clk x2), state 211-225
+				211: begin
+					vsfs_stop_txn <= 0;
+					if (ram_notbusy) begin
+						vsfs_stop_txn <= 0;
+						vsfs_start_read <= 1;
+						// y * 160 + x/2  + z_start
+						// vsfs_addr <= {7'b0,pixel_y,7'b0} + {9'b0,pixel_y,5'b0} + {15'b0,pixel_x[9:1]};
+						// v * 128 + u/2 + 153600
+						vsfs_addr <= {9'b0,pixel_v[19:12],7'b0} + {17'b0,pixel_u[19:13]} + 153600;
+						pixel_u8 <= pixel_u[12];
+						pixel_u <= pixel_u + u_bar_dx;
+						pixel_v <= pixel_v + v_bar_dx;
+						numread <= 0;
+						read_delay <= 0;
+						fsm_state <= 212;
+					end
+				end
+				//   -- wait for the first flash data to be ready, read one 4-bit
+				212: begin
+					vsfs_start_read <= 0;
+          if(read_delay == 16) begin
+            read_delay <= 0;
+            db_texel[7:4] <= spi_data;
+            numread <= 1;
+            fsm_state <= 213;
+          end 
+          else begin
+            read_delay <= read_delay + 1;
+          end
+				end
+				//   -- read 1 more 4bit
+				213: begin
+					db_texel[3:0] <= spi_data;
+          numread <= 0;
+          vsfs_stop_txn <= 1;
+          fsm_state <= 214;
+				end
+
+				214: begin
+					texel[0] <= (pixel_u8 == 1)? db_texel[7:4] : db_texel[3:0];
+					//texel[0] <= db_texel[3:0];
+
+
+					vsfs_stop_txn <= 0;
+					vsfs_start_read <= 1;
+					// v * 128 + u/2 + 153600
+					vsfs_addr <= {9'b0,pixel_v[19:12],7'b0} + {17'b0,pixel_u[19:13]} + 153600;
+					pixel_u8 <= pixel_u[12];
+					pixel_u <= pixel_u + u_bar_dx;
+					pixel_v <= pixel_v + v_bar_dx;
+					numread <= 0;
+					read_delay <= 0;
+					fsm_state <= 215;
+				end
+				215: begin
+					vsfs_start_read <= 0;
+          if(read_delay == 16) begin
+            read_delay <= 0;
+            db_texel[7:4] <= spi_data;
+            numread <= 1;
+            fsm_state <= 216;
+          end 
+          else begin
+            read_delay <= read_delay + 1;
+          end
+				end
+				//   -- read 1 more 4bit
+				216: begin
+					db_texel[3:0] <= spi_data;
+          numread <= 0;
+          vsfs_stop_txn <= 1;
+          fsm_state <= 217;
+				end
+				217: begin
+					texel[1] <= (pixel_u8 == 1)? db_texel[7:4] : db_texel[3:0];
+					//texel[1] <= db_texel[3:0];
+
+					vsfs_stop_txn <= 0;
+					if (ram_notbusy) begin
+						vsfs_stop_txn <= 0;
+						vsfs_start_read <= 1;
+
+						vsfs_addr <= {9'b0,pixel_v[19:12],7'b0} + {17'b0,pixel_u[19:13]} + 153600;
+						pixel_u8 <= pixel_u[12];
+						pixel_u <= pixel_u + u_bar_dx;
+						pixel_v <= pixel_v + v_bar_dx;
+						numread <= 0;
+						read_delay <= 0;
+						fsm_state <= 218;
+					end
+				end
+				//   -- wait for the first flash data to be ready, read one 4-bit
+				218: begin
+					vsfs_start_read <= 0;
+          if(read_delay == 16) begin
+            read_delay <= 0;
+            db_texel[7:4] <= spi_data;
+            numread <= 1;
+            fsm_state <= 219;
+          end 
+          else begin
+            read_delay <= read_delay + 1;
+          end
+				end
+				//   -- read 1 more 4bit
+				219: begin
+					db_texel[3:0] <= spi_data;
+          numread <= 0;
+          vsfs_stop_txn <= 1;
+          fsm_state <= 220;
+				end
+
+				220: begin
+					texel[2] <= (pixel_u8 == 1)? db_texel[7:4] : db_texel[3:0];
+					//texel[2] <= db_texel[3:0];
+
+					vsfs_stop_txn <= 0;
+					vsfs_start_read <= 1;
+					// v * 128 + u/2 + 153600
+					vsfs_addr <= {9'b0,pixel_v[19:12],7'b0} + {17'b0,pixel_u[19:13]} + 153600;
+					pixel_u8 <= pixel_u[12];
+					pixel_u <= pixel_u + u_bar_dx;
+					pixel_v <= pixel_v + v_bar_dx;
+					numread <= 0;
+					read_delay <= 0;
+					fsm_state <= 221;
+				end
+				221: begin
+					vsfs_start_read <= 0;
+          if(read_delay == 16) begin
+            read_delay <= 0;
+            db_texel[7:4] <= spi_data;
+            numread <= 1;
+            fsm_state <= 222;
+          end 
+          else begin
+            read_delay <= read_delay + 1;
+          end
+				end
+				//   -- read 1 more 4bit
+				222: begin
+					db_texel[3:0] <= spi_data;
+          numread <= 0;
+          vsfs_stop_txn <= 1;
+          fsm_state <= 223;
+				end
+				223: begin
+					texel[3] <= (pixel_u8 == 1)? db_texel[7:4] : db_texel[3:0];
+					//texel[3] <= db_texel[3:0];
+
+					vsfs_stop_txn <= 0;
+					fsm_state <= 122;
+				end
+
+
+
+				// x4 pixel
+				//	- if ((e0 > 0) && (e1 > 0) && (e2 > 0)) / e0 += dx, z += z_bar_dx
+				//		- pixel[0-4].cz = (Z < Zbuffer)? cz: pixel[0-4].cz
+				//	screen y, 0 at the top (reverse opengl), use e0 > 0
+				122: begin
+					fsm_state <= 123;
+
+					vsfs_stop_txn <= 0;
+					if ((e0 >= 0) && (e1 >= 0) && (e2 >= 0)) begin
+					//if (((e0 >= 0) && (e1 >= 0) && (e2 >= 0)) || ((e0 < 0) && (e1 < 0) && (e2 < 0))) begin
+						//C_buffer[0] <= (pixel_z[19:12] < Z_buffer[0])? tri_idx[3:0]+1 : C_buffer[0]; 
+						
+						C_buffer[0] <= ((pixel_z[15:8] < Z_buffer[0]) && (pixel_z[21:16] == 0))? 
+														((has_tex)? texel[0] : shade_color) : C_buffer[0]; 
+						Z_buffer[0] <= ((pixel_z[15:8] < Z_buffer[0]) && (pixel_z[21:16] == 0))? 
+														pixel_z[15:8] : Z_buffer[0]; 
+					end 
+					e0 <= e0 + (y_screen_v1 - y_screen_v0);
+					e1 <= e1 + (y_screen_v2 - y_screen_v1);
+					e2 <= e2 + (y_screen_v0 - y_screen_v2);
+					pixel_z <= pixel_z + z_bar_dx;
+				end
+				123: begin
+					fsm_state <= 124;
+
+					if ((e0 >= 0) && (e1 >= 0) && (e2 >= 0)) begin
+						C_buffer[1] <= ((pixel_z[15:8] < Z_buffer[1]) && (pixel_z[21:16] == 0))? 
+														((has_tex)? texel[1] : shade_color ) : C_buffer[1]; 
+						Z_buffer[1] <= ((pixel_z[15:8] < Z_buffer[1]) && (pixel_z[21:16] == 0))? 
+														pixel_z[15:8] : Z_buffer[1]; 
+					end 
+					e0 <= e0 + (y_screen_v1 - y_screen_v0);
+					e1 <= e1 + (y_screen_v2 - y_screen_v1);
+					e2 <= e2 + (y_screen_v0 - y_screen_v2);
+					pixel_z <= pixel_z + z_bar_dx;
+				end
+				124: begin
+					fsm_state <= 125;
+
+					if ((e0 >= 0) && (e1 >= 0) && (e2 >= 0)) begin
+						C_buffer[2] <= ((pixel_z[15:8] < Z_buffer[2]) && (pixel_z[21:16] == 0))? 
+														((has_tex)? texel[2] : shade_color ) : C_buffer[2]; 
+						Z_buffer[2] <= ((pixel_z[15:8] < Z_buffer[2]) && (pixel_z[21:16] == 0))? 
+														pixel_z[15:8] : Z_buffer[2]; 
+					end 
+					e0 <= e0 + (y_screen_v1 - y_screen_v0);
+					e1 <= e1 + (y_screen_v2 - y_screen_v1);
+					e2 <= e2 + (y_screen_v0 - y_screen_v2);
+					pixel_z <= pixel_z + z_bar_dx;
+				end
+				125: begin
+					fsm_state <= 126;
+
+					if ((e0 >= 0) && (e1 >= 0) && (e2 >= 0)) begin
+						C_buffer[3] <= ((pixel_z[15:8] < Z_buffer[3]) && (pixel_z[21:16] == 0))? 
+														((has_tex)? texel[3] : shade_color ) : C_buffer[3]; 
+						Z_buffer[3] <= ((pixel_z[15:8] < Z_buffer[3]) && (pixel_z[21:16] == 0))? 
+														pixel_z[15:8] : Z_buffer[3]; 
+					end 
+					e0 <= e0 + (y_screen_v1 - y_screen_v0);
+					e1 <= e1 + (y_screen_v2 - y_screen_v1);
+					e2 <= e2 + (y_screen_v0 - y_screen_v2);
+					pixel_z <= pixel_z + z_bar_dx;
+				end
+				// - WRITE x4 Z (16 clk) 
+				126: begin
+					if (ram_notbusy) begin
+						vsfs_stop_txn <= 0;
+						vsfs_start_write <= 1;
+						// y*320 + x + z_start
+						vsfs_addr <= {6'b0,pixel_y,8'b0} + {8'b0,pixel_y,6'b0} + {14'b0,pixel_x} + 76800;
+						vsfs_data_in <= Z_buffer[numread[2:1]][{~numread[0],2'b00} +: 4];
+						numread <= numread + 1;
+						fsm_state <= 127;
+					end
+				end
+				//   -- wait and write 4 Z
+				127: begin
+					vsfs_start_write <= 0;
+					if(spi_data_req)begin
+            vsfs_data_in <= Z_buffer[numread[2:1]][{~numread[0],2'b00} +: 4];
+            numread <= numread + 1;
+            if(numread == 7)begin
+	            numread <= 0;
+	            vsfs_stop_txn <= 1;
+	            fsm_state <= 128;
+	          end
+          end
+				end
+				// - WRITE x4 B (12 clk) 
+				128: begin
+					vsfs_stop_txn <= 0;
+					vsfs_start_write <= 1;
+					// y * 160 + x/2 + (offset back[0])
+					vsfs_addr <= (evenframe)?{7'b0,pixel_y,7'b0} + {9'b0,pixel_y,5'b0} + {15'b0,pixel_x[9:1]} + 38400:
+                              	{7'b0,pixel_y,7'b0} + {9'b0,pixel_y,5'b0} + {15'b0,pixel_x[9:1]};
+					vsfs_data_in <= C_buffer[numread[1:0]];
+					numread <= numread + 1;
+					fsm_state <= 129;
+				end
+				//   -- wait wait and write 4 color
+				129: begin
+					vsfs_start_write <= 0;
+					if(spi_data_req)begin
+            vsfs_data_in <= C_buffer[numread[1:0]];
+            numread <= numread + 1;
+            if(numread == 3)begin
+	            numread <= 0;
+	            vsfs_stop_txn <= 1;
+	            fsm_state <= 254;
+	          end
+          end
+				end
+
+
+
+				// - last line for pixel x
+				254: begin
+					vsfs_stop_txn <= 0;
+					pixel_x <= pixel_x + 4;
+					fsm_state <= 116;
+				end
+				// - last line for pixel y, max 255 state
+				255: begin
+					pixel_y <= pixel_y + 1;
+					fsm_state <= 115;
+				end
+
+				default: begin
+					fsm_state <= 0;
+				end
+			endcase
+    end
+  end
+
+
+
+  // debug
+  // assign debug_vsfs_fsm_state = fsm_state;
+  // assign debug_x_model_v0 = {8'b0,v0_u};
+  // assign debug_x_model_v1 = {8'b0,v0_v};
+  // assign debug_x_model_v2 = {8'b0,v1_u};
+  // assign debug_y_model_v0 = {8'b0,v1_v};
+  // assign debug_y_model_v1 = {8'b0,v2_u};
+  // assign debug_y_model_v2 = {8'b0,v2_v};
+  // assign debug_z_model_v0 = z_model_v0;
+  // assign debug_z_model_v1 = z_model_v1;
+  // assign debug_z_model_v2 = z_model_v2;
+  // assign debug_nx = nx;
+  // assign debug_ny = ny;
+  // assign debug_nz = nz;
+  // assign debug_tri_color = tri_color;
+
+
+  
+endmodule
