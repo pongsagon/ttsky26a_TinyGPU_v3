@@ -1,4 +1,4 @@
-`timescale 1ns / 1ps
+//`timescale 1ns / 1ps
 
 // white, pink, cyan, green
 // color[5:0] R1 R2 G1 G2 B1 B2

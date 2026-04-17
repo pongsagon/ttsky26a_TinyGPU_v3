@@ -1,4 +1,4 @@
-`timescale 1ns / 1ps
+//`timescale 1ns / 1ps
 
 
 // input 0-89 degree, Q0.8 [0,1] 0.004
