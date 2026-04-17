@@ -28,7 +28,7 @@ module tb ();
 `endif
 
   // Replace tt_um_example with your module name:
-  ttsky26a_TinyGPU_v3 (
+  tt_um_TinyGPU_v3 (
 
       // Include power ports for the Gate Level test:
 `ifdef GL_TEST
