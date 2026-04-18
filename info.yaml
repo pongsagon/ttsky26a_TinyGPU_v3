@@ -1,6 +1,6 @@
 # Tiny Tapeout project information
 project:
-  title:        "Tiniest GPU V2"      # Project title
+  title:        "Tiniest GPU V3"      # Project title
   author:       "Matt Pongsagon"      # Your name
   discord:      "pongsagon"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
   description:  "A GPU with ..."      # One line description of what your project does
