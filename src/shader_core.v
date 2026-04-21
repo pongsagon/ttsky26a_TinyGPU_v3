@@ -256,7 +256,7 @@ module shader_core (
                                 reg_p0[arg0] <= (mask[0])? reg_p0[arg0]:reg_p0[arg1];
                                 reg_p1[arg0] <= (mask[1])? reg_p1[arg0]:reg_p1[arg1];
                                 reg_p2[arg0] <= (mask[2])? reg_p2[arg0]:reg_p2[arg1];
-                                reg_p3[arg0] <= (mask[0])? reg_p3[arg0]:reg_p3[arg1];
+                                reg_p3[arg0] <= (mask[3])? reg_p3[arg0]:reg_p3[arg1];
                             end
                             // mov
                             8'b01_01_??_??: begin    
