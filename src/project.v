@@ -3,14 +3,16 @@
 
   Task: 
     0. enter Quad mode
-    0. read 3 byte
-      - #tri, tex? -> save as reg
+    0. read flash->reg
+      - #tri, tex?  3 byte
+      - shader_program 12 byte
     1. copy flash->ram 
       - 32768 byte: 256x256 tex, 4-bit/texel
       - each tri: 22/28 byte
     2. read front, clear back
+      - do_swap sent from vsfs.v
     3. clear z
-    4. swap
+
 
   Include module
     - vga
@@ -21,13 +23,11 @@
 
 
   Addr flash
-    - byte 0,1: #tri
-    - byte 3: tex?
-    // has tex
-    - byte 32768: 256x256 tex
-    - each tri: 28 byte
-    // no tex
-    - each tri: 22 byte
+    - 0:      #tri 2 byte
+    - 2:      tex?
+    - 3:      shader 12 byte
+    - 15:     tex (32768) + (#tri * 28)   // has tex
+              #tri * 22                   // no tex
 
  
   Addr RAM space
@@ -35,13 +35,11 @@
     - 0:      front, FLASH tri
     - 38400:  back (4bit x 320x240)
     - 76800:  z (8bit x 320x240)
-    - 153600: tri (<1024)
-      // has tex
-      - 32768 byte: 256x256 tex
-      - each tri: 28 byte
-      // no tex
-      - each tri: 22 byte
-
+    // case has tex
+    - 153600: tex (256x256 = 32768 byte, 2 texel/byte)
+    - 186368: tri, each tri 28 byte (<1024)
+    // case no tex
+    - 153600: tri, each tri 22 byte (<1024)
 
 
   - ui_in[2:0]: latency, 
@@ -61,34 +59,14 @@ module tt_um_TinyGPU_v3 (
     input  wire       ena,      // always 1 when the design is powered, so you can ignore it
     input  wire       clk,      // clock
     
-    // // sim version
+    // sim version
     // output wire [9:0] sim_x,
     // output wire [9:0] sim_y,
     // output wire sim_blank,
 
-    // // things to watch
+    // things to watch
     // output wire debug_do_swap,
-    // // output wire debug_ram_notbusy,
-    // output  wire [15:0] debug_x_model_v0,
-    // output  wire [15:0] debug_x_model_v1,
-    // output  wire [15:0] debug_x_model_v2,
-    // output  wire [15:0] debug_y_model_v0,
-    // output  wire [15:0] debug_y_model_v1,
-    // output  wire [15:0] debug_y_model_v2,
-    // output  wire [15:0] debug_z_model_v0,
-    // output  wire [15:0] debug_z_model_v1,
-    // output  wire [15:0] debug_z_model_v2,
-    // output  wire [15:0] debug_nx,
-    // output  wire [15:0] debug_ny,
-    // output  wire [15:0] debug_nz,
-    // output  wire [1:0] debug_tri_color,
-    // output wire [7:0] debug_vsfs_fsm_state,
-    // // output wire [9:0] debug_numtri,
-    // // output wire [4:0] debug_fsm_state,
-    // // output wire debug_start_printing,
-    // // output wire [3:0] debug_spi_data,
-    // output wire [7:0] debug_sub_frame,
-    // output reg [21:0] debug_clk,           // >2.11M   
+    // output wire [7:0] debug_sub_frame, 
 
     input  wire       rst_n    // reset_n - low to reset
   );
@@ -152,9 +130,15 @@ module tt_um_TinyGPU_v3 (
   reg start_vsfs;
   reg [9:0] numtri;         // <1024 tri
 
+  // shader program
+  reg [7:0] shader_program[11:0];
+  wire [3:0] shader_addr;
+  wire [7:0] shader_instr;
+  assign shader_instr = shader_program[shader_addr];
 
   // main FSM
   reg has_tex; 
+  reg [7:0] frame_num;        // only count 0-255
   reg [4:0] fsm_state;        // 0-31: state
   reg [4:0] read_delay;       // flash: 24, RAM R: 16,
   reg [17:0] numread;         // #4bit read, >153600 (#z pixel)
@@ -165,8 +149,8 @@ module tt_um_TinyGPU_v3 (
   wire [9:0] yplus1;          // to set addr for the next line
   assign yplus1 = y + 1;
   //
-  reg [15:0] i_numtri_byte;    // for loop read numtri, 1024x28=28672+32768 <65536
-  wire [15:0] numtri_byte;     // numtri * 22 (2 x 3xyz x 3vert + 4 (normal/color)), 22528
+  reg [15:0] i_numtri_byte;    // for loop read numtri, 1024x28=28672+32768=61440 <= 65535
+  wire [15:0] numtri_byte;     // numtri * 22 (2 x 3xyz x 3vert + 4 (normal/color)), 1024x22=22528
   wire [15:0] numtri_byte_tex; // numtri * 28 (22 + 2x3 (uv x 3vert)) + 32768;
   assign numtri_byte = {2'b0,numtri,4'b0} + {4'b0,numtri,2'b0} + {5'b0,numtri,1'b0};        // 16+4+2
   assign numtri_byte_tex = {2'b0,numtri,4'b0} + {3'b0,numtri,3'b0} 
@@ -230,26 +214,6 @@ module tt_um_TinyGPU_v3 (
   );
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
   vsfs _vsfs(
       .clk(clk),
       .reset(rst_n),
@@ -269,23 +233,9 @@ module tt_um_TinyGPU_v3 (
       .evenframe(evenframe),
       .gamepad_input(gamepad_input),
       .has_tex(has_tex),
-
-      //
-      // .debug_x_model_v0(debug_x_model_v0),
-      // .debug_x_model_v1(debug_x_model_v1),
-      // .debug_x_model_v2(debug_x_model_v2),
-      // .debug_y_model_v0(debug_y_model_v0),
-      // .debug_y_model_v1(debug_y_model_v1),
-      // .debug_y_model_v2(debug_y_model_v2),
-      // .debug_z_model_v0(debug_z_model_v0),
-      // .debug_z_model_v1(debug_z_model_v1),
-      // .debug_z_model_v2(debug_z_model_v2),
-      // .debug_nx(debug_nx),
-      // .debug_ny(debug_ny),
-      // .debug_nz(debug_nz),
-      // .debug_tri_color(debug_tri_color),
-      // .debug_vsfs_fsm_state(debug_vsfs_fsm_state),
-
+      .shader_instr(shader_instr),
+      .shader_addr(shader_addr),
+      .frame_num(frame_num),
       .ram_notbusy(ram_notbusy)
   );
 
@@ -337,10 +287,11 @@ module tt_um_TinyGPU_v3 (
       fsm_state <= 0;
       read_delay <= 0;
       numread <= 0;
+      frame_num <= 0;
       sub_frame <= 0;
       evenframe <= 1;
       i_numtri_byte <= 0;
-      // pixels [5:0], buffer[3:0]
+      // pixels [5:0], buffer[3:0], shader_program[11:0]
       //
       //debug_clk <= 0;
       // SPI
@@ -372,8 +323,9 @@ module tt_um_TinyGPU_v3 (
             fsm_state <= 2;
           end
         end
-      // 1. copy Flash -> RAM (fsm 2 - 10)
-        //  - read numtri (2 byte) + has_tex (1 byte), at addr 153600
+
+      // 0. read data to reg
+        //  - read numtri (2 byte) + has_tex (1 byte)
         2: begin
           display_stop_txn <= 0;
           numread <= 0;
@@ -412,12 +364,43 @@ module tt_um_TinyGPU_v3 (
           numtri[9:8] <= pixels[3][1:0];
           numtri[3:0] <= pixels[1];
           numtri[7:4] <= pixels[0];
-          i_numtri_byte <= 0;
-          display_addr <= 3;    // 1st addr of tex / tri
-          fsm_state <= 6;
+
+        //  - read shader program (12 byte)
+          numread <= 0;
+          spi_select_ROM <= 1;      // flash
+          display_start_read <= 1;
+          display_addr <= 3;    // 1st addr of shader_program
+          fsm_state <= 28;
         end
 
-        // 2 cases
+        //   -- wait for the first flash data to be ready
+        28: begin
+          display_start_read <= 0;
+          if(read_delay == 24) begin
+            read_delay <= 0;
+            shader_program[numread[4:1]][{numread[0],2'b0} +: 4] <= spi_data;
+            numread <= 1;
+            fsm_state <= 29;
+          end 
+          else begin
+            read_delay <= read_delay + 1;
+          end
+        end
+        //   -- read 23 more 4bit  (total of 12 byte)
+        29: begin
+          shader_program[numread[4:1]][{numread[0],2'b0} +: 4] <= spi_data;
+          numread <= numread + 1;
+          if(numread == 23)begin
+            numread <= 0;
+            display_stop_txn <= 1;
+            i_numtri_byte <= 0;
+            display_addr <= 15;    // 1st addr of tex / tri
+            fsm_state <= 6;
+          end
+        end
+
+
+      // 1. copy Flash -> RAM, 2 cases
         //  tex:
         //    - for loop copy tex from flash->ram
         //    - for loop copy each tri: 28 byte
@@ -479,7 +462,7 @@ module tt_um_TinyGPU_v3 (
               numread <= 0;
               display_stop_txn <= 1;
               // addr of flash
-              display_addr <= {8'b0,i_numtri_byte} + 5; // 5 = offset #tri+hastex 3byte + next 2 byte
+              display_addr <= {8'b0,i_numtri_byte} + 17; // 17 = offset #tri+hastex+shader_code 15byte + next 2 byte
               i_numtri_byte <= i_numtri_byte + 2;
               fsm_state <= 6;
             end
@@ -497,6 +480,7 @@ module tt_um_TinyGPU_v3 (
             // 4. swap, set for 1clk from VSFS
             evenframe <= !evenframe;
             sub_frame <= 0;
+            frame_num <= frame_num + 1;
           end
           else if ((y == 524) && (x == 783)) begin     //mark1: eof
             spi_select_ROM <= 0;
@@ -613,13 +597,8 @@ module tt_um_TinyGPU_v3 (
   // assign sim_x = x;
   // assign sim_y = y;
   // assign sim_blank = blank;
-  // // // debug
-  // // assign debug_numtri = numtri;
-  // // assign debug_fsm_state = fsm_state;
-  // // assign debug_start_printing = ((fsm_state == 11) && ((y == 524) && (x == 783)));
-  // // assign debug_spi_data = spi_data;
+  // debug
   // assign debug_sub_frame = sub_frame;
-  // // assign debug_ram_notbusy = ram_notbusy;
   // assign debug_do_swap = do_swap;
 
     

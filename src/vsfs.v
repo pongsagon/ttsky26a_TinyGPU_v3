@@ -20,10 +20,11 @@
 		6,7: +-rotY light
 
   color mode 1 tex
-  	0: black
-  	1: blue
-  	2: dark green
-		15:
+  	0-3: black, 			dark blue, 		dark green, 	blue
+  	4-7: green, 			light blue, 	light green, 	cyan
+  	8-b: red, 				dark pink, 		orange, 			pink
+  	c-f: orange-yell, light pink, 	yellow, 			white
+
 
 	color mode 2 flat shade, each with 3 level + black
 		0: white
@@ -100,8 +101,12 @@ module vsfs (
   	// gamepad input
   	input 	wire [7:0]  gamepad_input,
   	input   wire 				has_tex,
-  	
 
+  	// shader_program
+  	input   wire [7:0]	shader_instr,
+  	output	wire [3:0]	shader_addr,
+  	input   wire [7:0]	frame_num,
+  	
     // things to watch
     // output  wire [15:0] debug_x_model_v0,
     // output  wire [15:0] debug_x_model_v1,
@@ -318,7 +323,7 @@ module vsfs (
   reg signed [21:0] z_bar_dx;
   reg signed [21:0] z_bar_dy;
   // bar uv
-  reg signed [21:0] u_bar;						// Q14.8 (for neg/>1 out of tri bar) 
+  reg signed [21:0] u_bar;						// Q10.12 (for neg/>1 out of tri bar) 
   reg signed [21:0] u_bar_dx;
   reg signed [21:0] u_bar_dy;
   reg signed [21:0] v_bar;						
@@ -339,6 +344,40 @@ module vsfs (
   reg [3:0] texel [3:0];							// Q4.0
   reg [7:0] Z_buffer [3:0];						// Q0.8
   reg [3:0] C_buffer [3:0];						// Q4.0
+  
+  // shader
+  reg shader_exec;
+  wire [3:0] shader_color [3:0];			// Q4.0, output from shader
+  reg [7:0] shader_uv [7:0];					// Q8.0
+
+  shader_core _core1(
+  			.clk(clk),
+      	.reset(reset),
+      	.exec(shader_exec),
+      	.shader_instr(shader_instr),
+      	.shader_addr(shader_addr),
+      	.texel_0(texel[0]),
+      	.texel_1(texel[1]),
+      	.texel_2(texel[2]),
+      	.texel_3(texel[3]),
+      	.pixel_x(pixel_x[7:0]), 
+      	.pixel_y(pixel_y[7:0]), 
+      	.tri_idx(tri_idx[7:0]),
+      	.shade_color(shade_color),
+      	.frame_num(frame_num),
+      	.pixel_u_0(shader_uv[0]),
+      	.pixel_v_0(shader_uv[1]),
+      	.pixel_u_1(shader_uv[2]),
+      	.pixel_v_1(shader_uv[3]),
+      	.pixel_u_2(shader_uv[4]),
+      	.pixel_v_2(shader_uv[5]),
+      	.pixel_u_3(shader_uv[6]),
+      	.pixel_v_3(shader_uv[7]),
+      	.shader_color_0(shader_color[0]),
+      	.shader_color_1(shader_color[1]),
+      	.shader_color_2(shader_color[2]),
+      	.shader_color_3(shader_color[3])
+  );
 
   // from gamepad
   reg manualRot;										// 0: do autoRot, 1: manual
@@ -955,6 +994,8 @@ module vsfs (
 		  v_bar_dy <= 0;
 		  db_texel <= 0;
 	    //Z_buffer[3:0], C_buffer[3:0], texel [3:0]
+	    //shader_uv[7:0]
+	    shader_exec <= 0;
 	    pixel_y <= 0;
   		pixel_x <= 0;
   		pixel_z <= 0;
@@ -1667,14 +1708,14 @@ module vsfs (
         //   -- chk normal -/+
 				34: begin
 					vsfs_stop_txn <= 0;
-					x_model_v0 <= tri_xyz[0] + 16'sb0000_1110_0000_0000;	
-					y_model_v0 <= tri_xyz[1] - 16'sb0000_1000_0000_0000;		
+					x_model_v0 <= tri_xyz[0];// + 16'sb0000_1110_0000_0000;	
+					y_model_v0 <= tri_xyz[1];// - 16'sb0000_1000_0000_0000;		
 					z_model_v0 <= tri_xyz[2];
-					x_model_v1 <= tri_xyz[3] + 16'sb0000_1110_0000_0000;	
-					y_model_v1 <= tri_xyz[4] - 16'sb0000_1000_0000_0000;	
+					x_model_v1 <= tri_xyz[3];// + 16'sb0000_1110_0000_0000;	
+					y_model_v1 <= tri_xyz[4];// - 16'sb0000_1000_0000_0000;	
 					z_model_v1 <= tri_xyz[5];
-					x_model_v2 <= tri_xyz[6] + 16'sb0000_1110_0000_0000;	
-					y_model_v2 <= tri_xyz[7] - 16'sb0000_1000_0000_0000;				
+					x_model_v2 <= tri_xyz[6];// + 16'sb0000_1110_0000_0000;	
+					y_model_v2 <= tri_xyz[7];// - 16'sb0000_1000_0000_0000;				
 					z_model_v2 <= tri_xyz[8];
 					tri_color <= tri_xyz[10][15:14];
 					nz <= (tri_xyz[10][13] == 1'b1)? {6'b1111_11,tri_xyz[10][13:4]} : {6'b0,tri_xyz[10][13:4]};
@@ -2759,89 +2800,23 @@ module vsfs (
 					end
 				end
 				// - for x in bbox (x < bboxMax_X)
-				//	- READ x4 Z (23 clk)
+				//	- if has_tex read tex before read ZB
 				116: begin
 					if (pixel_x > bboxMax_X[9:0]) begin
 						fsm_state <= 255;
 					end else begin
-						if (ram_notbusy) begin
-							vsfs_stop_txn <= 0;
-							vsfs_start_read <= 1;
-							// y*320 + x + z_start
-							vsfs_addr <= {6'b0,pixel_y,8'b0} + {8'b0,pixel_y,6'b0} + {14'b0,pixel_x} + 76800;
-							numread <= 0;
-							read_delay <= 0;
-							fsm_state <= 117;
-						end
-					end
-				end
-				//   -- wait for the first flash data to be ready
-				117: begin
-					vsfs_start_read <= 0;
-          if(read_delay == 16) begin
-            read_delay <= 0;
-            Z_buffer[numread[2:1]][{~numread[0],2'b00} +: 4] <= spi_data;
-            numread <= 1;
-            fsm_state <= 118;
-          end 
-          else begin
-            read_delay <= read_delay + 1;
-          end
-				end
-				//   -- read 7 more 4bit
-				118: begin
-					Z_buffer[numread[2:1]][{~numread[0],2'b00} +: 4] <= spi_data;
-          numread <= numread + 1;
-          if(numread == 7)begin
-            numread <= 0;
-            vsfs_stop_txn <= 1;
-            fsm_state <= 119;
-          end
-				end
-				//	- READ x4 B (19 clk)
-				119: begin
-					vsfs_stop_txn <= 0;
-					vsfs_start_read <= 1;
-					// y * 160 + x/2 + (offset back[0])
-					vsfs_addr <= (evenframe)?{7'b0,pixel_y,7'b0} + {9'b0,pixel_y,5'b0} + {15'b0,pixel_x[9:1]} + 38400:
-                                	{7'b0,pixel_y,7'b0} + {9'b0,pixel_y,5'b0} + {15'b0,pixel_x[9:1]};
-					numread <= 0;
-					read_delay <= 0;
-					fsm_state <= 120;
-				end
-				//   -- wait for the first flash data to be ready
-				120: begin
-					vsfs_start_read <= 0;
-          if(read_delay == 16) begin
-            read_delay <= 0;
-            C_buffer[numread[1:0]] <= spi_data;
-            numread <= 1;
-            fsm_state <= 121;
-          end 
-          else begin
-            read_delay <= read_delay + 1;
-          end
-				end
-				//   -- read 3 more 4bit
-				121: begin
-					C_buffer[numread[1:0]] <= spi_data;
-          numread <= numread + 1;
-          if(numread == 3)begin
-            numread <= 0;
-            vsfs_stop_txn <= 1;
-
-            if(has_tex)begin
+						if(has_tex)begin
             	// read texel x4
             	fsm_state <= 211;
             end else begin
             	// skip read texel
-            	fsm_state <= 122;
+            	fsm_state <= 251;
             end
-          end
+					end
 				end
-
 				// uv Q10.12 -> Q8.0 [19:12]
 				//	- READ x4 texel (35 clk x2), state 211-225
+				//	- read 1 byte (2 texel)
 				211: begin
 					vsfs_stop_txn <= 0;
 					if (ram_notbusy) begin
@@ -2854,6 +2829,8 @@ module vsfs (
 						pixel_u8 <= pixel_u[12];
 						pixel_u <= pixel_u + u_bar_dx;
 						pixel_v <= pixel_v + v_bar_dx;
+						shader_uv[0] <= pixel_u[19:12];
+						shader_uv[1] <= pixel_v[19:12];
 						numread <= 0;
 						read_delay <= 0;
 						fsm_state <= 212;
@@ -2879,8 +2856,8 @@ module vsfs (
           vsfs_stop_txn <= 1;
           fsm_state <= 214;
 				end
-
 				214: begin
+					// chk even/odd texel
 					texel[0] <= (pixel_u8 == 1)? db_texel[7:4] : db_texel[3:0];
 					//texel[0] <= db_texel[3:0];
 
@@ -2892,6 +2869,8 @@ module vsfs (
 					pixel_u8 <= pixel_u[12];
 					pixel_u <= pixel_u + u_bar_dx;
 					pixel_v <= pixel_v + v_bar_dx;
+					shader_uv[2] <= pixel_u[19:12];
+					shader_uv[3] <= pixel_v[19:12];
 					numread <= 0;
 					read_delay <= 0;
 					fsm_state <= 215;
@@ -2928,6 +2907,8 @@ module vsfs (
 						pixel_u8 <= pixel_u[12];
 						pixel_u <= pixel_u + u_bar_dx;
 						pixel_v <= pixel_v + v_bar_dx;
+						shader_uv[4] <= pixel_u[19:12];
+						shader_uv[5] <= pixel_v[19:12];
 						numread <= 0;
 						read_delay <= 0;
 						fsm_state <= 218;
@@ -2953,7 +2934,6 @@ module vsfs (
           vsfs_stop_txn <= 1;
           fsm_state <= 220;
 				end
-
 				220: begin
 					texel[2] <= (pixel_u8 == 1)? db_texel[7:4] : db_texel[3:0];
 					//texel[2] <= db_texel[3:0];
@@ -2965,6 +2945,8 @@ module vsfs (
 					pixel_u8 <= pixel_u[12];
 					pixel_u <= pixel_u + u_bar_dx;
 					pixel_v <= pixel_v + v_bar_dx;
+					shader_uv[6] <= pixel_u[19:12];
+					shader_uv[7] <= pixel_v[19:12];
 					numread <= 0;
 					read_delay <= 0;
 					fsm_state <= 221;
@@ -2993,10 +2975,95 @@ module vsfs (
 					//texel[3] <= db_texel[3:0];
 
 					vsfs_stop_txn <= 0;
-					fsm_state <= 122;
+					fsm_state <= 251;
 				end
 
+				//	- READ x4 Z (23 clk)
+				251:begin
+					if (ram_notbusy) begin
+						vsfs_stop_txn <= 0;
+						vsfs_start_read <= 1;
+						// y*320 + x + z_start
+						vsfs_addr <= {6'b0,pixel_y,8'b0} + {8'b0,pixel_y,6'b0} + {14'b0,pixel_x} + 76800;
+						numread <= 0;
+						read_delay <= 0;
+						fsm_state <= 117;
 
+				//		- start Shader
+						shader_exec <= 1;
+					end
+				end
+				//   -- wait for the first flash data to be ready
+				117: begin
+					shader_exec <= 0;
+					vsfs_start_read <= 0;
+          if(read_delay == 16) begin
+            read_delay <= 0;
+            Z_buffer[numread[2:1]][{~numread[0],2'b00} +: 4] <= spi_data;
+            numread <= 1;
+            fsm_state <= 118;
+          end 
+          else begin
+            read_delay <= read_delay + 1;
+          end
+				end
+				//   -- read 7 more 4bit
+				118: begin
+					Z_buffer[numread[2:1]][{~numread[0],2'b00} +: 4] <= spi_data;
+          numread <= numread + 1;
+          if(numread == 7)begin
+            numread <= 0;
+            vsfs_stop_txn <= 1;
+            fsm_state <= 119;
+          end
+				end
+				//	- READ x4 B (19 clk)
+				119: begin
+					vsfs_stop_txn <= 0;
+					vsfs_start_read <= 1;
+					// y * 160 + x/2 + (offset back[0])
+					vsfs_addr <= (evenframe)?{7'b0,pixel_y,7'b0} + {9'b0,pixel_y,5'b0} + {15'b0,pixel_x[9:1]} + 38400:
+                                	{7'b0,pixel_y,7'b0} + {9'b0,pixel_y,5'b0} + {15'b0,pixel_x[9:1]};
+					numread <= 0;
+					read_delay <= 0;
+					fsm_state <= 120;
+
+					//debug read shader_program
+					//shader_addr <= 8;
+
+				end
+				//   -- wait for the first flash data to be ready
+				120: begin
+					vsfs_start_read <= 0;
+          if(read_delay == 16) begin
+            read_delay <= 0;
+            C_buffer[numread[1:0]] <= spi_data;
+            numread <= 1;
+            fsm_state <= 121;
+
+            //debug read shader_program
+						//shader_addr <= 9;
+						//shader_color[numread[1:0]] <= shader_instr[3:0];
+
+          end 
+          else begin
+            read_delay <= read_delay + 1;
+          end
+				end
+				//   -- read 3 more 4bit
+				121: begin
+					//debug read shader_program
+					//shader_addr <= shader_addr + 1;
+					//shader_color[numread[1:0]] <= shader_instr[3:0];
+
+					C_buffer[numread[1:0]] <= spi_data;
+          numread <= numread + 1;
+          if(numread == 3)begin
+            numread <= 0;
+            vsfs_stop_txn <= 1;
+            fsm_state <= 122;
+          end
+				end
 
 				// x4 pixel
 				//	- if ((e0 > 0) && (e1 > 0) && (e2 > 0)) / e0 += dx, z += z_bar_dx
@@ -3011,7 +3078,7 @@ module vsfs (
 						//C_buffer[0] <= (pixel_z[19:12] < Z_buffer[0])? tri_idx[3:0]+1 : C_buffer[0]; 
 						
 						C_buffer[0] <= ((pixel_z[15:8] < Z_buffer[0]) && (pixel_z[21:16] == 0))? 
-														((has_tex)? texel[0] : shade_color) : C_buffer[0]; 
+														shader_color[0] : C_buffer[0]; 
 						Z_buffer[0] <= ((pixel_z[15:8] < Z_buffer[0]) && (pixel_z[21:16] == 0))? 
 														pixel_z[15:8] : Z_buffer[0]; 
 					end 
@@ -3025,7 +3092,7 @@ module vsfs (
 
 					if ((e0 >= 0) && (e1 >= 0) && (e2 >= 0)) begin
 						C_buffer[1] <= ((pixel_z[15:8] < Z_buffer[1]) && (pixel_z[21:16] == 0))? 
-														((has_tex)? texel[1] : shade_color ) : C_buffer[1]; 
+														shader_color[1] : C_buffer[1]; 
 						Z_buffer[1] <= ((pixel_z[15:8] < Z_buffer[1]) && (pixel_z[21:16] == 0))? 
 														pixel_z[15:8] : Z_buffer[1]; 
 					end 
@@ -3039,7 +3106,7 @@ module vsfs (
 
 					if ((e0 >= 0) && (e1 >= 0) && (e2 >= 0)) begin
 						C_buffer[2] <= ((pixel_z[15:8] < Z_buffer[2]) && (pixel_z[21:16] == 0))? 
-														((has_tex)? texel[2] : shade_color ) : C_buffer[2]; 
+														shader_color[2] : C_buffer[2]; 
 						Z_buffer[2] <= ((pixel_z[15:8] < Z_buffer[2]) && (pixel_z[21:16] == 0))? 
 														pixel_z[15:8] : Z_buffer[2]; 
 					end 
@@ -3053,7 +3120,7 @@ module vsfs (
 
 					if ((e0 >= 0) && (e1 >= 0) && (e2 >= 0)) begin
 						C_buffer[3] <= ((pixel_z[15:8] < Z_buffer[3]) && (pixel_z[21:16] == 0))? 
-														((has_tex)? texel[3] : shade_color ) : C_buffer[3]; 
+														shader_color[3] : C_buffer[3]; 
 						Z_buffer[3] <= ((pixel_z[15:8] < Z_buffer[3]) && (pixel_z[21:16] == 0))? 
 														pixel_z[15:8] : Z_buffer[3]; 
 					end 
