@@ -3,7 +3,7 @@ project:
   title:        "Tiniest GPU V3"      # Project title
   author:       "Matt Pongsagon"      # Your name
   discord:      "pongsagon"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "A GPU with ..."      # One line description of what your project does
+  description:  "A GPU with programmable pixel shader"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     25175000       # Clock frequency in Hz (or 0 if not applicable)
 
