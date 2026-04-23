@@ -104,7 +104,7 @@ module vsfs (
 
   	// shader_program
   	input   wire [7:0]	shader_instr,
-  	output	wire [3:0]	shader_addr,
+  	output	wire [4:0]	shader_addr,
   	input   wire [7:0]	frame_num,
   	
     // things to watch
@@ -3027,10 +3027,6 @@ module vsfs (
 					numread <= 0;
 					read_delay <= 0;
 					fsm_state <= 120;
-
-					//debug read shader_program
-					//shader_addr <= 8;
-
 				end
 				//   -- wait for the first flash data to be ready
 				120: begin
@@ -3040,11 +3036,6 @@ module vsfs (
             C_buffer[numread[1:0]] <= spi_data;
             numread <= 1;
             fsm_state <= 121;
-
-            //debug read shader_program
-						//shader_addr <= 9;
-						//shader_color[numread[1:0]] <= shader_instr[3:0];
-
           end 
           else begin
             read_delay <= read_delay + 1;
@@ -3052,10 +3043,6 @@ module vsfs (
 				end
 				//   -- read 3 more 4bit
 				121: begin
-					//debug read shader_program
-					//shader_addr <= shader_addr + 1;
-					//shader_color[numread[1:0]] <= shader_instr[3:0];
-
 					C_buffer[numread[1:0]] <= spi_data;
           numread <= numread + 1;
           if(numread == 3)begin

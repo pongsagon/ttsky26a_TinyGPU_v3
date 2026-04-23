@@ -5,7 +5,7 @@
     0. enter Quad mode
     0. read flash->reg
       - #tri, tex?  3 byte
-      - shader_program 12 byte
+      - shader_program 31 byte
     1. copy flash->ram 
       - 32768 byte: 256x256 tex, 4-bit/texel
       - each tri: 22/28 byte
@@ -25,8 +25,8 @@
   Addr flash
     - 0:      #tri 2 byte
     - 2:      tex?
-    - 3:      shader 12 byte
-    - 15:     tex (32768) + (#tri * 28)   // has tex
+    - 3:      shader 31 byte
+    - 34:     tex (32768) + (#tri * 28)   // has tex
               #tri * 22                   // no tex
 
  
@@ -131,8 +131,8 @@ module tt_um_TinyGPU_v3 (
   reg [9:0] numtri;         // <1024 tri
 
   // shader program
-  reg [7:0] shader_program[11:0];
-  wire [3:0] shader_addr;
+  reg [7:0] shader_program[30:0];
+  wire [4:0] shader_addr;
   wire [7:0] shader_instr;
   assign shader_instr = shader_program[shader_addr];
 
@@ -291,7 +291,7 @@ module tt_um_TinyGPU_v3 (
       sub_frame <= 0;
       evenframe <= 1;
       i_numtri_byte <= 0;
-      // pixels [5:0], buffer[3:0], shader_program[11:0]
+      // pixels [5:0], buffer[3:0], shader_program[30:0]
       //
       //debug_clk <= 0;
       // SPI
@@ -365,7 +365,7 @@ module tt_um_TinyGPU_v3 (
           numtri[3:0] <= pixels[1];
           numtri[7:4] <= pixels[0];
 
-        //  - read shader program (12 byte)
+        //  - read shader program (31 byte)
           numread <= 0;
           spi_select_ROM <= 1;      // flash
           display_start_read <= 1;
@@ -378,7 +378,7 @@ module tt_um_TinyGPU_v3 (
           display_start_read <= 0;
           if(read_delay == 24) begin
             read_delay <= 0;
-            shader_program[numread[4:1]][{numread[0],2'b0} +: 4] <= spi_data;
+            shader_program[numread[5:1]][{numread[0],2'b0} +: 4] <= spi_data;
             numread <= 1;
             fsm_state <= 29;
           end 
@@ -386,15 +386,15 @@ module tt_um_TinyGPU_v3 (
             read_delay <= read_delay + 1;
           end
         end
-        //   -- read 23 more 4bit  (total of 12 byte)
+        //   -- read 61 more 4bit  (total of 31 byte)
         29: begin
-          shader_program[numread[4:1]][{numread[0],2'b0} +: 4] <= spi_data;
+          shader_program[numread[5:1]][{numread[0],2'b0} +: 4] <= spi_data;
           numread <= numread + 1;
-          if(numread == 23)begin
+          if(numread == 61)begin
             numread <= 0;
             display_stop_txn <= 1;
             i_numtri_byte <= 0;
-            display_addr <= 15;    // 1st addr of tex / tri
+            display_addr <= 34;    // 1st addr of tex / tri
             fsm_state <= 6;
           end
         end
@@ -462,7 +462,7 @@ module tt_um_TinyGPU_v3 (
               numread <= 0;
               display_stop_txn <= 1;
               // addr of flash
-              display_addr <= {8'b0,i_numtri_byte} + 17; // 17 = offset #tri+hastex+shader_code 15byte + next 2 byte
+              display_addr <= {8'b0,i_numtri_byte} + 36; // 36 = offset #tri+hastex+shader_code 34byte + next 2 byte
               i_numtri_byte <= i_numtri_byte + 2;
               fsm_state <= 6;
             end

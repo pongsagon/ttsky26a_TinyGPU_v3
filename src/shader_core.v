@@ -29,7 +29,7 @@ module shader_core (
 
     input   wire        exec,           // vsfs.v  send true for 1 clk
     input   wire [7:0]  shader_instr,
-    output  reg  [3:0]  shader_addr,
+    output  reg  [4:0]  shader_addr,
 
     input   wire [3:0]  texel_0,
     input   wire [3:0]  texel_1,
@@ -110,12 +110,35 @@ module shader_core (
                     if (exec) begin
                         shader_addr <= 0;
                         fsm_state <= 1;
+
+                        // reset 
+                        shader_color_0 <= 0;
+                        shader_color_0 <= 1;
+                        shader_color_0 <= 2;
+                        shader_color_0 <= 3;
+                        reg_p1[0] <= 0;
+                        reg_p1[1] <= 0;
+                        reg_p1[2] <= 0;
+                        reg_p1[3] <= 0;
+                        reg_p2[0] <= 0;
+                        reg_p2[1] <= 0;
+                        reg_p2[2] <= 0;
+                        reg_p2[3] <= 0;
+                        reg_p3[0] <= 0;
+                        reg_p3[1] <= 0;
+                        reg_p3[2] <= 0;
+                        reg_p3[3] <= 0;
+                        reg_p0[0] <= 0;
+                        reg_p0[1] <= 0;
+                        reg_p0[2] <= 0;
+                        reg_p0[3] <= 0;
+                        mask <= 0;
                     end
                 end
                 // run
                 1: begin
                     shader_addr <= shader_addr + 1;
-                    if (shader_addr == 12) begin
+                    if (shader_addr == 31) begin
                         fsm_state <= 0;
                     end else begin    
                         casez (shader_instr)
