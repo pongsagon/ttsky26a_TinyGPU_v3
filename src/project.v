@@ -292,6 +292,15 @@ module tt_um_TinyGPU_v3 (
       evenframe <= 1;
       i_numtri_byte <= 0;
       // pixels [5:0], buffer[3:0], shader_program[30:0]
+      for (int i=0; i<6; i++) begin
+          pixels[i] <= 0;
+      end
+      for (int i=0; i<4; i++) begin
+          buffer[i] <= 0;
+      end
+      for (int i=0; i<31; i++) begin
+          shader_program[i] <= 0;
+      end
       //
       //debug_clk <= 0;
       // SPI

@@ -993,8 +993,15 @@ module vsfs (
 		  v_bar_dx <= 0;
 		  v_bar_dy <= 0;
 		  db_texel <= 0;
-	    //Z_buffer[3:0], C_buffer[3:0], texel [3:0]
-	    //shader_uv[7:0]
+	    //Z_buffer[3:0], C_buffer[3:0], texel [3:0], shader_uv[7:0]
+	    for (int i=0; i<4; i++) begin
+          Z_buffer[i] <= 0;
+          C_buffer[i] <= 0;
+          texel[i] <= 0;
+      end
+      for (int i=0; i<8; i++) begin
+          shader_uv[i] <= 0;
+      end
 	    shader_exec <= 0;
 	    pixel_y <= 0;
   		pixel_x <= 0;
