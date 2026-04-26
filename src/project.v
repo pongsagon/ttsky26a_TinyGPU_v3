@@ -150,7 +150,8 @@ module tt_um_TinyGPU_v3 (
   reg [7:0] frame_num;        // only count 0-255
   reg [4:0] fsm_state;        // 0-31: state
   reg [4:0] read_delay;       // flash: 24, RAM R: 16,
-  reg [17:0] numread;         // #4bit read, >153600 (#z pixel)
+  reg [8:0] numread;          // #4bit read, >319 (#f,b pixel)
+  reg [17:0] numwrite;        // #4bit read, >153600 (#z pixel)
   reg [3:0] pixels [5:0];     // do 4pixel at atime, pixels[5:4] is for reading has_tex bit
   reg [3:0] buffer [3:0]; 
   reg [7:0] sub_frame;        // must < 255, start with 1 not 0
@@ -296,6 +297,7 @@ module tt_um_TinyGPU_v3 (
       fsm_state <= 0;
       read_delay <= 0;
       numread <= 0;
+	  numwrite <= 0;
       frame_num <= 0;
       sub_frame <= 0;
       evenframe <= 1;
@@ -557,7 +559,8 @@ module tt_um_TinyGPU_v3 (
             display_data_in <= 4'b0000;
             numread <= numread + 1;
             if(numread == 319)begin 
-              numread <= 0;            
+              numread <= 0;       
+			  numwrite <= 0;
               display_stop_txn <= 1;
               if (y == 239) begin               //mark5: to clearZ
                 fsm_state <= 17;
@@ -585,32 +588,32 @@ module tt_um_TinyGPU_v3 (
           display_start_write <= 1;
           display_addr <= 76800;
           display_data_in <= 4'b1111;   // 0.996 fartest
-          numread <= numread + 1;
+		  numwrite <= numwrite + 1;
           fsm_state <= 18;
         end
         18: begin
           display_start_write <= 0;
           if (spi_data_req) begin
             display_data_in <= 4'b1111;
-            numread <= numread + 1;
-            if (numread == 153599)begin       //mark6: fin clear z
-              numread <= 0;
+            numwrite <= numwrite + 1;
+            if (numwrite == 153599)begin       //mark6: fin clear z
+              numwrite <= 0;
               display_stop_txn <= 1;       
               start_vsfs <= 1;
               fsm_state <= 11;
             end 
-			// else if (&numread[7:0] == 1) begin     // pause burst read for a clk        
-              // display_stop_txn <= 1;   
-              // fsm_state <= 19;
-            // end
+			else if (&numwrite[7:0] == 1) begin     // pause burst read for a clk        
+              display_stop_txn <= 1;   
+              fsm_state <= 19;
+            end
           end
         end
-        // 19: begin
-          // display_stop_txn <= 0;
-          // display_start_write <= 1;
-          // display_addr <= 24'd76800 + {7'b0,numread[17:1]};   // 2 read = 1 byte
-          // fsm_state <= 18;
-        // end
+        19: begin
+          display_stop_txn <= 0;
+          display_start_write <= 1;
+          display_addr <= 24'd76800 + {7'b0,numwrite[17:1]};   // 2 read = 1 byte
+          fsm_state <= 18;
+        end
 
 
 
