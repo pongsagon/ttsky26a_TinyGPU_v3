@@ -598,18 +598,19 @@ module tt_um_TinyGPU_v3 (
               display_stop_txn <= 1;       
               start_vsfs <= 1;
               fsm_state <= 11;
-            end else if (&numread[7:0] == 1) begin     // pause burst read for a clk        
-              display_stop_txn <= 1;   
-              fsm_state <= 19;
-            end
+            end 
+			// else if (&numread[7:0] == 1) begin     // pause burst read for a clk        
+              // display_stop_txn <= 1;   
+              // fsm_state <= 19;
+            // end
           end
         end
-        19: begin
-          display_stop_txn <= 0;
-          display_start_write <= 1;
-          display_addr <= 24'd76800 + {7'b0,numread[17:1]};   // 2 read = 1 byte
-          fsm_state <= 18;
-        end
+        // 19: begin
+          // display_stop_txn <= 0;
+          // display_start_write <= 1;
+          // display_addr <= 24'd76800 + {7'b0,numread[17:1]};   // 2 read = 1 byte
+          // fsm_state <= 18;
+        // end
 
 
 
