@@ -1,6 +1,9 @@
 ![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg) ![](../../workflows/fpga/badge.svg)
+## Initial test on FPGA, ASIC is coming in Jan 2027
+<img width="320" height="320" alt="pongsagon_vichit_-_TinyGPU_v3 0_is_coming_with_a_programmable_Pixel_Shader_Tested_on_PqSKMH-ezgif com-video-to-gif-converter" src="https://github.com/user-attachments/assets/033d94d7-ade1-4c91-816c-2962c5b310e9" />
+<img width="480" height="270" alt="pongsagon_vichit_-_Every_pixel_needs_a_depth_test_but_RAM_is_slow _TinyGPU_v3 0_hides_oIgDfE-ezgif com-video-to-gif-converter" src="https://github.com/user-attachments/assets/12408132-af74-433a-8992-8393fe99732c" />
 
-## The project is in constantly updating and experimenting.  Some commit may not work.  Please comeback again after it is finalize with documentation
+
 
 # Tiny Tapeout Verilog Project Template
 
